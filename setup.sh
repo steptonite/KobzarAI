@@ -55,13 +55,59 @@ mkdir -p "$HOME/.ollama"
 cp "$REPO/panel/start-ollama.sh" "$HOME/.ollama/start-ollama.sh"
 chmod +x "$HOME/.ollama/start-ollama.sh"
 
+# 6. Іконка + застосунок KobzarAI.app (клікабельний, як звичайна програма)
+echo "→ Іконка та KobzarAI.app…"
+"$PANEL_DIR/.venv/bin/python" "$PANEL_DIR/make_icon.py" >/dev/null 2>&1 || true
+APP_DIR="/Applications"; [ -w "$APP_DIR" ] || APP_DIR="$HOME/Applications"
+mkdir -p "$APP_DIR"
+APP="$APP_DIR/KobzarAI.app"
+rm -rf "$APP"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+[ -f "$PANEL_DIR/app.icns" ] && cp "$PANEL_DIR/app.icns" "$APP/Contents/Resources/app.icns"
+
+cat > "$APP/Contents/Info.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>CFBundleIdentifier</key><string>ua.kobzarai.panel</string>
+  <key>CFBundleName</key><string>KobzarAI</string>
+  <key>CFBundleDisplayName</key><string>KobzarAI</string>
+  <key>CFBundleExecutable</key><string>KobzarAI</string>
+  <key>CFBundleIconFile</key><string>app</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleVersion</key><string>1.0</string>
+  <key>LSUIElement</key><true/>
+  <key>LSMinimumSystemVersion</key><string>12.0</string>
+</dict></plist>
+PLIST
+
+# Лаунчер: БЕЗ exec (інакше macOS 26 не малює меню-бар-іконку, FB21015611).
+# Запускає копію python-бінарника всередині bundle → Dock-ідентичність = KobzarAI.
+cat > "$APP/Contents/MacOS/KobzarAI" <<'LAUNCH'
+#!/bin/bash
+DIR="$(cd "$(dirname "$0")" && pwd)"
+BIN="$DIR/KobzarAI-bin"
+VENV="$HOME/.local/kobzarai/.venv/bin/python"
+if [ ! -x "$BIN" ]; then            # створюємо bundle-бінарник при першому запуску
+  FW="$("$VENV" -c 'import sys,os;print(os.path.join(sys.base_prefix,"Resources","Python.app","Contents","MacOS","Python"))' 2>/dev/null)"
+  [ -x "$FW" ] && cp "$FW" "$BIN" && codesign --force --sign - "$BIN" 2>/dev/null
+fi
+[ -x "$BIN" ] || BIN="$VENV"
+export __PYVENV_LAUNCHER__="$VENV"
+export __CFBundleIdentifier="ua.kobzarai.panel"
+"$BIN" "$HOME/.local/kobzarai/panel.py" >/tmp/kobzarai.log 2>&1 &
+wait
+LAUNCH
+chmod +x "$APP/Contents/MacOS/KobzarAI"
+
 cat <<EOF
 
-✓ Готово. Лишилось:
-  1) Хоча б одна модель Ollama:    ollama pull qwen3:4b
-  2) (опц.) диск моделей на SSD:    export KOBZARAI_DISK="/Volumes/ТвійSSD"
-  3) Запуск:
-       $PANEL_DIR/.venv/bin/python $PANEL_DIR/panel.py
+✓ Готово. KobzarAI.app → $APP
+
+Лишилось:
+  1) Хоча б одна модель Ollama:   ollama pull qwen3:4b
+  2) (опц.) моделі на зовнішньому SSD:   export KOBZARAI_DISK="/Volumes/ТвійSSD"
+  3) Запусти KobzarAI з Launchpad (або open "$APP").
   4) При першому старті дай дозвіл Accessibility (хоткеї + читання виділеного):
-       Системні налаштування → Конфіденційність і безпека → Доступність → +KobzarAI
+     Системні налаштування → Конфіденційність і безпека → Доступність → +KobzarAI
 EOF
