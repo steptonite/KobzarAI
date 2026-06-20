@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# LocalAI Panel — menu-bar керування Ollama + TTS + RAM + глобальні хоткеї. Без автозапуску, ручний СТОП.
+# Kobzar — menu-bar керування Ollama + TTS + RAM + глобальні хоткеї. Без автозапуску, ручний СТОП.
 import os, subprocess, tempfile, threading, time, urllib.request, json, shlex, re
 import rumps
 import objc
@@ -317,7 +317,7 @@ def fetch_ollama_library():
     try:
         req = urllib.request.Request(
             "https://ollama.com/v1/models",
-            headers={"User-Agent": "LocalAI-panel"})
+            headers={"User-Agent": "Kobzar-panel"})
         with urllib.request.urlopen(req, timeout=12) as r:
             data = json.loads(r.read().decode("utf-8"))
         ids = sorted({d.get("id") for d in data.get("data", []) if d.get("id")})
@@ -351,7 +351,7 @@ def fetch_model_size(model_id):
         url = f"https://registry.ollama.ai/v2/library/{name}/manifests/{tag}"
         req = urllib.request.Request(url, headers={
             "Accept": "application/vnd.docker.distribution.manifest.v2+json",
-            "User-Agent": "LocalAI-panel"})
+            "User-Agent": "Kobzar-panel"})
         with urllib.request.urlopen(req, timeout=12) as r:
             m = json.loads(r.read().decode("utf-8"))
         tot = sum(l.get("size", 0) for l in m.get("layers", []))
@@ -376,7 +376,7 @@ def fetch_hf_gguf(query="", limit=60):
         if q:
             params["search"] = q
         url = "https://huggingface.co/api/models?" + urllib.parse.urlencode(params)
-        req = urllib.request.Request(url, headers={"User-Agent": "LocalAI-panel"})
+        req = urllib.request.Request(url, headers={"User-Agent": "Kobzar-panel"})
         with urllib.request.urlopen(req, timeout=12) as r:
             data = json.loads(r.read().decode("utf-8"))
         rows = [{"id": m.get("id"), "dl": m.get("downloads"), "kind": "hf"}
@@ -391,7 +391,7 @@ def fetch_hf_repo_size(repo):
     Сумує split-частини того кванта. None при збої."""
     try:
         url = f"https://huggingface.co/api/models/{repo}/tree/main"
-        req = urllib.request.Request(url, headers={"User-Agent": "LocalAI-panel"})
+        req = urllib.request.Request(url, headers={"User-Agent": "Kobzar-panel"})
         with urllib.request.urlopen(req, timeout=12) as r:
             files = json.loads(r.read().decode("utf-8"))
         ggufs = {}
@@ -996,7 +996,7 @@ class SettingsWindow(NSObject):
         # напівпрозорість справжня: opaque-вікно ігнорувало слайдер прозорості.
         self.win.setOpaque_(False)
         self.win.setBackgroundColor_(NSColor.clearColor())
-        self.win.setTitle_("LocalAI — Налаштування")
+        self.win.setTitle_("Kobzar — Налаштування")
         self.win.setTitleVisibility_(1)            # NSWindowTitleHidden
         self.win.setTitlebarAppearsTransparent_(True)
         self.win.setMovableByWindowBackground_(True)
@@ -1230,7 +1230,7 @@ class SettingsWindow(NSObject):
         self.auto_login = NSButton.alloc().initWithFrame_(
             NSMakeRect(x0 + LP_PAD, self._cy(top, 0, 22), cw - 2 * LP_PAD, 22))
         self.auto_login.setButtonType_(3)
-        self.auto_login.setTitle_("Запускати LocalAI разом із входом у систему")
+        self.auto_login.setTitle_("Запускати Kobzar разом із входом у систему")
         self.auto_login.setState_(1 if cfg.get("autostart_login") else 0)
         self.auto_login.setTarget_(self); self.auto_login.setAction_("autoLoginToggled:")
         self.auto_login.setAutoresizingMask_(8); v.addSubview_(self.auto_login)
@@ -1631,7 +1631,7 @@ class SettingsWindow(NSObject):
         if not ok:
             sender.setState_(0)
             cfg = load_cfg(); cfg["autostart_login"] = False; save_cfg(cfg)
-            rumps.notification("LocalAI", "Не вдалося внести в автозапуск входу",
+            rumps.notification("Kobzar", "Не вдалося внести в автозапуск входу",
                                "Додай вручну: Системні налаштування → Загальні → Елементи входу")
 
     def transpChanged_(self, sender):
@@ -1835,7 +1835,7 @@ class SettingsWindow(NSObject):
     def applyModelsDir_(self, sender):
         p = str(self.models_field.stringValue()).strip()
         cfg = load_cfg(); cfg["models_dir"] = p or None; save_cfg(cfg)
-        rumps.notification("LocalAI", "Папку моделей збережено",
+        rumps.notification("Kobzar", "Папку моделей збережено",
                            "Перезапусти Ollama, щоб застосувати")
         self.panel._refresh_settings_models()
 
@@ -2140,7 +2140,7 @@ class Panel(rumps.App):
         except Exception: pass
         # назва+іконка для Dock (коли вікно відкрите стаємо Foreground)
         try:
-            NSProcessInfo.processInfo().setProcessName_("LocalAI")
+            NSProcessInfo.processInfo().setProcessName_("Kobzar")
         except Exception: pass
         try:
             ic = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon.png")
@@ -2322,7 +2322,7 @@ class Panel(rumps.App):
                 name = "cpu.fill" if up else "cpu"
                 tint = tts
             btn = self._nsapp.nsstatusitem.button()
-            img = NSImage.imageWithSystemSymbolName_accessibilityDescription_(name, "LocalAI")
+            img = NSImage.imageWithSystemSymbolName_accessibilityDescription_(name, "Kobzar")
             if not img:
                 return
             if tint:
