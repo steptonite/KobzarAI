@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Kobzar — menu-bar керування Ollama + TTS + RAM + глобальні хоткеї. Без автозапуску, ручний СТОП.
+# KobzarAI — menu-bar керування Ollama + TTS + RAM + глобальні хоткеї. Без автозапуску, ручний СТОП.
 import os, subprocess, tempfile, threading, time, urllib.request, json, shlex, re
 import rumps
 import objc
@@ -23,7 +23,7 @@ from Foundation import (NSObject, NSAutoreleasePool, NSMakeRect, NSMakeRange,
 from WebKit import WKWebView, WKWebViewConfiguration
 from PyObjCTools import AppHelper
 
-APA = os.environ.get("LOCALAI_DISK", "/Volumes/ExternalSSD")
+APA = os.environ.get("KOBZARAI_DISK", "/Volumes/ExternalSSD")
 OLLAMA = "/opt/homebrew/bin/ollama"
 DEFAULT_MODELS_DIR = f"{APA}/ollama-models"
 
@@ -39,7 +39,7 @@ TTS_DIR = os.path.expanduser("~/.local/styletts2-ua-server")
 TTS_PORT = 5050
 OLLAMA_HOST = "127.0.0.1:11434"
 VOICES = ["Артем Окороков", "Анастасія Павленко", "Денис Денисенко", "filatov"]
-CONFIG = os.path.expanduser("~/.local/localai-panel/config.json")
+CONFIG = os.path.expanduser("~/.local/kobzarai/config.json")
 
 # дефолтні хоткеї: лише ⌃⌥ (виділене) і ⌃⌥⇧ (пауза); буфер/стоп — порожні
 DEFAULT_HOTKEYS = {
@@ -317,7 +317,7 @@ def fetch_ollama_library():
     try:
         req = urllib.request.Request(
             "https://ollama.com/v1/models",
-            headers={"User-Agent": "Kobzar-panel"})
+            headers={"User-Agent": "KobzarAI-panel"})
         with urllib.request.urlopen(req, timeout=12) as r:
             data = json.loads(r.read().decode("utf-8"))
         ids = sorted({d.get("id") for d in data.get("data", []) if d.get("id")})
@@ -351,7 +351,7 @@ def fetch_model_size(model_id):
         url = f"https://registry.ollama.ai/v2/library/{name}/manifests/{tag}"
         req = urllib.request.Request(url, headers={
             "Accept": "application/vnd.docker.distribution.manifest.v2+json",
-            "User-Agent": "Kobzar-panel"})
+            "User-Agent": "KobzarAI-panel"})
         with urllib.request.urlopen(req, timeout=12) as r:
             m = json.loads(r.read().decode("utf-8"))
         tot = sum(l.get("size", 0) for l in m.get("layers", []))
@@ -376,7 +376,7 @@ def fetch_hf_gguf(query="", limit=60):
         if q:
             params["search"] = q
         url = "https://huggingface.co/api/models?" + urllib.parse.urlencode(params)
-        req = urllib.request.Request(url, headers={"User-Agent": "Kobzar-panel"})
+        req = urllib.request.Request(url, headers={"User-Agent": "KobzarAI-panel"})
         with urllib.request.urlopen(req, timeout=12) as r:
             data = json.loads(r.read().decode("utf-8"))
         rows = [{"id": m.get("id"), "dl": m.get("downloads"), "kind": "hf"}
@@ -391,7 +391,7 @@ def fetch_hf_repo_size(repo):
     Сумує split-частини того кванта. None при збої."""
     try:
         url = f"https://huggingface.co/api/models/{repo}/tree/main"
-        req = urllib.request.Request(url, headers={"User-Agent": "Kobzar-panel"})
+        req = urllib.request.Request(url, headers={"User-Agent": "KobzarAI-panel"})
         with urllib.request.urlopen(req, timeout=12) as r:
             files = json.loads(r.read().decode("utf-8"))
         ggufs = {}
@@ -996,7 +996,7 @@ class SettingsWindow(NSObject):
         # напівпрозорість справжня: opaque-вікно ігнорувало слайдер прозорості.
         self.win.setOpaque_(False)
         self.win.setBackgroundColor_(NSColor.clearColor())
-        self.win.setTitle_("Kobzar — Налаштування")
+        self.win.setTitle_("KobzarAI — Налаштування")
         self.win.setTitleVisibility_(1)            # NSWindowTitleHidden
         self.win.setTitlebarAppearsTransparent_(True)
         self.win.setMovableByWindowBackground_(True)
@@ -1072,7 +1072,7 @@ class SettingsWindow(NSObject):
             it.setView_(holder)
             tabs.addTabViewItem_(it)
         try:
-            self.select_tab(min(int(os.environ.get("LOCALAI_TAB", "0")), len(TABS) - 1))
+            self.select_tab(min(int(os.environ.get("KOBZARAI_TAB", "0")), len(TABS) - 1))
         except Exception: pass
 
     # ---------- вкладка: ГОЛОС (лише озвучення) ----------
@@ -1230,7 +1230,7 @@ class SettingsWindow(NSObject):
         self.auto_login = NSButton.alloc().initWithFrame_(
             NSMakeRect(x0 + LP_PAD, self._cy(top, 0, 22), cw - 2 * LP_PAD, 22))
         self.auto_login.setButtonType_(3)
-        self.auto_login.setTitle_("Запускати Kobzar разом із входом у систему")
+        self.auto_login.setTitle_("Запускати KobzarAI разом із входом у систему")
         self.auto_login.setState_(1 if cfg.get("autostart_login") else 0)
         self.auto_login.setTarget_(self); self.auto_login.setAction_("autoLoginToggled:")
         self.auto_login.setAutoresizingMask_(8); v.addSubview_(self.auto_login)
@@ -1631,7 +1631,7 @@ class SettingsWindow(NSObject):
         if not ok:
             sender.setState_(0)
             cfg = load_cfg(); cfg["autostart_login"] = False; save_cfg(cfg)
-            rumps.notification("Kobzar", "Не вдалося внести в автозапуск входу",
+            rumps.notification("KobzarAI", "Не вдалося внести в автозапуск входу",
                                "Додай вручну: Системні налаштування → Загальні → Елементи входу")
 
     def transpChanged_(self, sender):
@@ -1815,7 +1815,7 @@ class SettingsWindow(NSObject):
         if self.lib_detail is not None:
             self.lib_detail.setStringValue_("Завантаження списку…")
         def work():
-            if os.environ.get("LOCALAI_FORCE_OFFLINE"):   # тест-хук: імітація офлайну
+            if os.environ.get("KOBZARAI_FORCE_OFFLINE"):   # тест-хук: імітація офлайну
                 rows, ok = [], False
             elif src == "hf":
                 rows, ok = fetch_hf_gguf(q)
@@ -1835,7 +1835,7 @@ class SettingsWindow(NSObject):
     def applyModelsDir_(self, sender):
         p = str(self.models_field.stringValue()).strip()
         cfg = load_cfg(); cfg["models_dir"] = p or None; save_cfg(cfg)
-        rumps.notification("Kobzar", "Папку моделей збережено",
+        rumps.notification("KobzarAI", "Папку моделей збережено",
                            "Перезапусти Ollama, щоб застосувати")
         self.panel._refresh_settings_models()
 
@@ -2134,13 +2134,13 @@ class SettingsWindow(NSObject):
 
 class Panel(rumps.App):
     def __init__(self):
-        super().__init__("AI", quit_button=None)
+        super().__init__("KobzarAI", quit_button=None)
         try:
             NSApplication.sharedApplication().setActivationPolicy_(1)  # accessory (без док-іконки)
         except Exception: pass
         # назва+іконка для Dock (коли вікно відкрите стаємо Foreground)
         try:
-            NSProcessInfo.processInfo().setProcessName_("Kobzar")
+            NSProcessInfo.processInfo().setProcessName_("KobzarAI")
         except Exception: pass
         try:
             ic = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon.png")
@@ -2166,6 +2166,8 @@ class Panel(rumps.App):
         self._speak_gen = 0
         self._state = "idle"
         self._live = None
+        self._live_buf = ""
+        self._live_nflush = 0
         self._tts_starting = False
         self._settings = None
         self._chat = None
@@ -2322,7 +2324,7 @@ class Panel(rumps.App):
                 name = "cpu.fill" if up else "cpu"
                 tint = tts
             btn = self._nsapp.nsstatusitem.button()
-            img = NSImage.imageWithSystemSymbolName_accessibilityDescription_(name, "Kobzar")
+            img = NSImage.imageWithSystemSymbolName_accessibilityDescription_(name, "KobzarAI")
             if not img:
                 return
             if tint:
@@ -2540,6 +2542,8 @@ class Panel(rumps.App):
         q = _q.Queue()
         END = object()
         self._live = (gen, q, END)
+        self._live_buf = ""        # батчинг: копимо речення, синтезуємо шматками
+        self._live_nflush = 0      # перший шматок малий (швидкий старт), далі більший
 
         def worker():
             pool = NSAutoreleasePool.alloc().init()
@@ -2573,15 +2577,34 @@ class Panel(rumps.App):
         threading.Thread(target=worker, daemon=True).start()
         return gen
 
+    def _live_flush(self, gen):
+        """Злити накопичений буфер у чергу синтезу одним шматком."""
+        live = getattr(self, "_live", None)
+        if not (live and live[0] == gen and gen == self._speak_gen):
+            self._live_buf = ""; return
+        buf = (getattr(self, "_live_buf", "") or "").strip()
+        self._live_buf = ""
+        if buf:
+            live[1].put(buf)
+            self._live_nflush = getattr(self, "_live_nflush", 0) + 1
+
     def _live_feed(self, gen, sentence):
         live = getattr(self, "_live", None)
-        if live and live[0] == gen and gen == self._speak_gen:
-            sentence = (sentence or "").strip()
-            if sentence: live[1].put(sentence)
+        if not (live and live[0] == gen and gen == self._speak_gen):
+            return
+        sentence = (sentence or "").strip()
+        if not sentence:
+            return
+        self._live_buf = (self._live_buf + " " + sentence).strip() if getattr(self, "_live_buf", "") else sentence
+        # перший шматок короткий (швидкий старт), далі копимо довше → менше дрейфу тембру
+        thresh = 60 if getattr(self, "_live_nflush", 0) == 0 else 200
+        if len(self._live_buf) >= thresh:
+            self._live_flush(gen)
 
     def _live_end(self, gen):
         live = getattr(self, "_live", None)
         if live and live[0] == gen:
+            self._live_flush(gen)                      # залишок буфера
             live[1].put(live[2])                       # END-сентинел
 
     def speak_clipboard(self, _): self._speak(sh("pbpaste"))
@@ -2614,10 +2637,10 @@ class Panel(rumps.App):
 
 if __name__ == "__main__":
     _p = Panel()
-    if os.environ.get("LOCALAI_OPEN_SETTINGS"):  # тест-хук: одразу показати Налаштування
+    if os.environ.get("KOBZARAI_OPEN_SETTINGS"):  # тест-хук: одразу показати Налаштування
         def _open_once(t):
             t.stop(); _p.open_settings(None)
-            if os.environ.get("LOCALAI_CHAT_DEMO") and _p._settings:
+            if os.environ.get("KOBZARAI_CHAT_DEMO") and _p._settings:
                 s = _p._settings
                 s.sessions[0]["history"] = [
                     {"role": "user", "content": "Привіт! Назви три кольори українською."},

@@ -1,8 +1,8 @@
 #!/bin/bash
 # Лаунчер Ollama для панелі. Скопіюй у ~/.ollama/start-ollama.sh (саме там його шукає панель).
-# Папку моделей і прапори оптимізації задає UI панелі (config.json). Дефолт диска — LOCALAI_DISK.
-CFG="$HOME/.local/localai-panel/config.json"
-MODELS="${LOCALAI_DISK:-/Volumes/ExternalSSD}/ollama-models"
+# Папку моделей і прапори оптимізації задає UI панелі (config.json). Дефолт диска — KOBZARAI_DISK.
+CFG="$HOME/.local/kobzarai/config.json"
+MODELS="${KOBZARAI_DISK:-/Volumes/ExternalSSD}/ollama-models"
 FLASH=1; KV=1                              # дефолти = обидві оптимізації увімкнені
 if [ -f "$CFG" ]; then
   V=$(/usr/bin/python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("models_dir") or "")' "$CFG" 2>/dev/null)

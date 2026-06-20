@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Генерує іконку LocalAI: чіп + звукохвиля. Slate-фон, янтарний акцент.
+"""Генерує іконку KobzarAI: чіп + звукохвиля. Slate-фон, янтарний акцент.
 Виводить app.icns + icon.png (для README/GitHub)."""
 import math
 import os
