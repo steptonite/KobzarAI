@@ -1101,7 +1101,7 @@ class SettingsWindow(NSObject):
             sl.setTarget_(self); sl.setAction_(action); sl.setAutoresizingMask_(2)
             v.addSubview_(sl)
             val = self._lbl(v, fmt(cur), cx + cwid - valw, self._cy(top, yrow, 18),
-                            valw, h=18, mask=4, align=1)
+                            valw, h=18, mask=1, align=1)   # пришпилено праворуч (1=MinXMargin)
             val.setFont_(NSFont.monospacedSystemFontOfSize_weight_(12.0, 0.0))
             return sl, val
 
@@ -2515,9 +2515,9 @@ class Panel(rumps.App):
                     except _q.Empty: continue
                     if snd is END: break              # черга вичерпана
                     if gen != self._speak_gen: return
-                    if not first:                      # дихалка між шматками (сервер так робить
-                        gap = max(0.12, getattr(self, "pause", 0.15))   # всередині POST, а між
-                        t_end = time.time() + gap                       # шматками тиші нема)
+                    pz = getattr(self, "pause", 0.0)
+                    if not first and pz > 0:           # явна пауза між шматками; 0 = без тиші
+                        t_end = time.time() + pz
                         while time.time() < t_end:
                             if gen != self._speak_gen: return
                             time.sleep(0.04)
@@ -2544,10 +2544,13 @@ class Panel(rumps.App):
         self._live = (gen, q, END)
         self._live_buf = ""        # батчинг: копимо речення, синтезуємо шматками
         self._live_nflush = 0      # перший шматок малий (швидкий старт), далі більший
+        sq = _q.Queue(maxsize=4)   # готові звуки — синтез біжить НАПЕРЕД програвання
+        SND_END = object()
 
-        def worker():
+        # СИНТЕЗ: тягне текст від LLM, синтезує й кладе готовий звук у sq.
+        # Працює поки грає попередній шматок → нема паузи "на синтез наступного".
+        def synth_loop():
             pool = NSAutoreleasePool.alloc().init()
-            first = True
             try:
                 if not self._wait_tts():
                     self._state = "idle"; return
@@ -2560,10 +2563,26 @@ class Panel(rumps.App):
                     try: snd = self._synth_sound(item, gen)
                     except Exception: snd = None
                     if snd is None: continue
+                    while gen == self._speak_gen:       # put, що прокидається на скасування
+                        try: sq.put(snd, timeout=0.2); break
+                        except _q.Full: continue
+            finally:
+                sq.put(SND_END); del pool
+
+        # ПРОГРАВАННЯ: грає готові звуки впритул. Між ними — лише явна пауза (0 = 0).
+        def play_loop():
+            pool = NSAutoreleasePool.alloc().init()
+            first = True
+            try:
+                while True:
                     if gen != self._speak_gen: return
-                    if not first:                      # дихалка між реченнями
-                        gap = max(0.12, getattr(self, "pause", 0.15))
-                        t_end = time.time() + gap
+                    try: snd = sq.get(timeout=0.2)
+                    except _q.Empty: continue
+                    if snd is SND_END: break
+                    if gen != self._speak_gen: return
+                    pz = getattr(self, "pause", 0.0)
+                    if not first and pz > 0:           # жодної підлоги: 0 = без тиші
+                        t_end = time.time() + pz
                         while time.time() < t_end:
                             if gen != self._speak_gen: return
                             time.sleep(0.04)
@@ -2574,7 +2593,8 @@ class Panel(rumps.App):
                 self._state = "idle"
             finally:
                 del pool
-        threading.Thread(target=worker, daemon=True).start()
+        threading.Thread(target=synth_loop, daemon=True).start()
+        threading.Thread(target=play_loop, daemon=True).start()
         return gen
 
     def _live_flush(self, gen):
@@ -2596,8 +2616,9 @@ class Panel(rumps.App):
         if not sentence:
             return
         self._live_buf = (self._live_buf + " " + sentence).strip() if getattr(self, "_live_buf", "") else sentence
-        # перший шматок короткий (швидкий старт), далі копимо довше → менше дрейфу тембру
-        thresh = 60 if getattr(self, "_live_nflush", 0) == 0 else 200
+        # РЕАЛТАЙМ > згладжування: перше речення — одразу (миттєвий старт), далі
+        # зливаємо лише зовсім короткі фрагменти (<50), повноцінні речення йдуть негайно.
+        thresh = 1 if getattr(self, "_live_nflush", 0) == 0 else 50
         if len(self._live_buf) >= thresh:
             self._live_flush(gen)
 
