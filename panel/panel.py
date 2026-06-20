@@ -1140,7 +1140,7 @@ class SettingsWindow(NSObject):
                          cw - LP_PAD - 170 - 14, gray=True, h=16)
         hint.setFont_(NSFont.systemFontOfSize_(12.0))
 
-        # ── РЕЖИМ ОЗВУЧЕННЯ ── перемикач Базовий / Стрім (стабільний дефолт = Базовий)
+        # ── РЕЖИМ ОЗВУЧЕННЯ ── Базовий / Швидкий / Наживо (стабільний дефолт = Базовий)
         y = btn_y - LP_SEC - 6
         top = self._grp(v, "РЕЖИМ ОЗВУЧЕННЯ", x0, y, cw)
         self._card(v, x0, top, cw, 1)
@@ -1149,8 +1149,8 @@ class SettingsWindow(NSObject):
             NSMakeRect(cx, self._cy(top, 0, 26), 300, 26))
         ms.setSegmentCount_(3); ms.setSegmentStyle_(1)
         ms.setLabel_forSegment_("Базовий", 0)
-        ms.setLabel_forSegment_("Стрім", 1)
-        ms.setLabel_forSegment_("Реалтайм", 2)
+        ms.setLabel_forSegment_("Швидкий", 1)
+        ms.setLabel_forSegment_("Наживо", 2)
         ms.setWidth_forSegment_(90, 0); ms.setWidth_forSegment_(90, 1); ms.setWidth_forSegment_(110, 2)
         ms.setSelectedSegment_({"base": 0, "stream": 1, "realtime": 2}.get(tts_mode(), 0))
         try: ms.setSelectedSegmentBezelColor_(accent_color())
@@ -1158,10 +1158,10 @@ class SettingsWindow(NSObject):
         ms.setTarget_(self); ms.setAction_("ttsModeChanged:"); ms.setAutoresizingMask_(8)
         v.addSubview_(ms); self.tts_mode = ms
         cb = top - (2 * LP_PAD + 1 * LP_ROW)           # низ картки
-        n = self._lbl(v, "Базовий — цілим файлом (стабільно). "
-                         "Стрім — конвеєр, швидкий старт для виділеного/буфера. "
-                         "Реалтайм — чат озвучує поки модель пише; звучання трохи гірше — "
-                         "тембр стрибає між реченнями (норма для цього режиму).",
+        n = self._lbl(v, "Базовий — цілим файлом, найрівніший тембр, але повільніший старт. "
+                         "Швидкий — миттєвий старт, без швів на довгому тексті (для виділеного/буфера). "
+                         "Наживо — чат озвучує поки модель пише; тембр стрибає між реченнями (норма). "
+                         "«Наживо» діє лише у вбудованому чаті.",
                       x0 + LP_PAD, cb - 46, cw - 2 * LP_PAD, gray=True, h=44)
         n.setFont_(NSFont.systemFontOfSize_(11.0))
         try: n.cell().setWraps_(True)
@@ -2165,6 +2165,7 @@ class Panel(rumps.App):
         self._snd = None
         self._speak_gen = 0
         self._state = "idle"
+        self._pause_pending = False   # пауза, натиснута під час синтезу → застосувати на старті відтворення
         self._live = None
         self._live_buf = ""
         self._live_nflush = 0
@@ -2317,7 +2318,7 @@ class Panel(rumps.App):
 
     def _set_icon(self, up, tts):
         try:
-            if self._state == "synth":     name, tint = "hourglass", True
+            if self._state == "synth":     name, tint = ("pause.fill" if self._pause_pending else "hourglass"), True
             elif self._state == "playing": name, tint = "waveform", True
             elif self._state == "paused":  name, tint = "pause.fill", True
             else:
@@ -2363,7 +2364,7 @@ class Panel(rumps.App):
             self.menu["loaded_line"].title = "   " + nm + (f"  ·  {sz}" if sz else "")
         else:
             self.menu["loaded_line"].title = "   (нічого — RAM вільна)"
-        if self._state == "synth":   p = "⏳ Синтез…"
+        if self._state == "synth":   p = "▶ Продовжити (стартує на паузі)" if self._pause_pending else "⏳ Синтез…"
         elif self._state == "playing": p = "❚❚ Пауза"
         elif self._state == "paused":  p = "▶ Продовжити"
         else: p = "Пауза / продовжити"
@@ -2371,7 +2372,7 @@ class Panel(rumps.App):
         active = self._state in ("synth", "playing", "paused")
         self.menu["tts_stop"].set_callback(self.stop_speech if active else None)
         self.menu["tts_pause"].set_callback(
-            self.pause_speech if self._state in ("playing", "paused") else None)
+            self.pause_speech if self._state in ("synth", "playing", "paused") else None)
         self.menu["unload_models"].set_callback(self.unload_models if loaded else None)
         if self._settings is not None:
             self._settings.refresh(up)
@@ -2431,7 +2432,14 @@ class Panel(rumps.App):
     def _play_sound(self, snd, gen):
         """Програти й дочекатися кінця, поважаючи паузу/стоп. False = скасовано."""
         if gen != self._speak_gen: return False
-        self._snd = snd; self._state = "playing"; snd.play()
+        self._snd = snd; snd.play()
+        if self._pause_pending:                 # пауза озброєна під час синтезу — стартуємо вже на паузі
+            self._pause_pending = False
+            try: snd.pause()
+            except Exception: pass
+            self._state = "paused"
+        else:
+            self._state = "playing"
         while True:
             if gen != self._speak_gen:
                 try: snd.stop()
@@ -2635,6 +2643,9 @@ class Panel(rumps.App):
         self._speak(txt)
 
     def pause_speech(self, _):
+        if self._state == "synth":              # ще синтезуємо — озброюємо/знімаємо відкладену паузу
+            self._pause_pending = not self._pause_pending
+            return
         if self._snd is None: return
         if self._state == "playing":
             if self._snd.pause(): self._state = "paused"
@@ -2643,6 +2654,7 @@ class Panel(rumps.App):
 
     def stop_speech(self, _):
         self._speak_gen += 1            # скасувати будь-який синтез, що ще триває
+        self._pause_pending = False
         if self._snd is not None:
             try: self._snd.stop()
             except Exception: pass
