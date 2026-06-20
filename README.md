@@ -2,7 +2,7 @@
 
 Офлайн AI-робоче місце для macOS. Меню-бар застосунок тримає поруч локальну мовну модель ([Ollama](https://ollama.com)) і українську озвучку (StyleTTS2): модель пише — голос одразу читає. Без інтернету, акаунтів і телеметрії.
 
-`macOS · Apple Silicon` &nbsp;•&nbsp; `офлайн` &nbsp;•&nbsp; `українська` &nbsp;•&nbsp; `MIT`
+![License](https://img.shields.io/badge/License-MIT-yellow.svg) ![Python](https://img.shields.io/badge/python-3.12-3776AB?logo=python&logoColor=white) ![Platform](https://img.shields.io/badge/macOS-Apple%20Silicon-000000?logo=apple&logoColor=white) ![Offline](https://img.shields.io/badge/%D0%BE%D1%84%D0%BB%D0%B0%D0%B9%D0%BD-100%25-2ea44f)
 
 https://github.com/user-attachments/assets/f9051aa5-fbd5-4335-b7f2-872babf68f73
 
@@ -18,7 +18,7 @@ https://github.com/user-attachments/assets/f9051aa5-fbd5-4335-b7f2-872babf68f73
 
 ## Встановлення
 
-Потрібні [Homebrew](https://brew.sh) і Python 3.12 (`brew install python@3.12`).
+Відкрий **Термінал** (Програми → Утиліти) і встав три рядки:
 
 ```bash
 git clone https://github.com/steptonite/KobzarAI.git
@@ -26,13 +26,15 @@ cd KobzarAI
 ./setup.sh
 ```
 
-`setup.sh` робить усе сам: ставить панель і TTS-сервер (кожен у власному venv), завантажує голоси, кладе лаунчер Ollama і збирає **KobzarAI.app** у Програмах. Далі лишається:
+Це все. `setup.sh` сам встановить усе потрібне (зокрема Homebrew, Python і Ollama — якщо їх ще нема; може один раз запитати пароль Mac), завантажить голоси й збере застосунок **KobzarAI** у Програмах.
 
-1. Завантажити модель: `ollama pull qwen3:4b`
-2. Запустити **KobzarAI** з Launchpad.
-3. При першому старті дати дозвіл Accessibility (Системні налаштування → Конфіденційність і безпека → Доступність) — для хоткеїв і читання виділеного.
+Далі — мишкою:
 
-Ваги StyleTTS2 підтягуються автоматично при першому синтезі. Моделі на зовнішньому SSD: `export KOBZARAI_DISK="/Volumes/ТвійSSD"` перед запуском.
+1. Запусти **KobzarAI** з Launchpad.
+2. Коли macOS запитає — дозволь **Accessibility** (для хоткеїв і читання виділеного тексту).
+3. У меню застосунку натисни завантажити модель — і готово.
+
+Жодних команд, env-змінних чи правок файлів далі не треба: модель, голос, диск для моделей — усе кнопками в самому застосунку.
 
 ## Режими озвучки
 
@@ -56,7 +58,7 @@ cd KobzarAI
 | Швидкий чернетковий | **gemma3:1b** |
 | Embeddings (RAG) | **nomic-embed-text** |
 
-Прапори оптимізації (`OLLAMA_FLASH_ATTENTION`, `OLLAMA_KV_CACHE_TYPE=q8_0`, `OLLAMA_MAX_LOADED_MODELS=1`…) зашиті в `start-ollama.sh`. `num_ctx` ≤ 8192 — критично, інакше своп.
+Оптимізації під 8 ГБ (Flash Attention, 8-біт KV-кеш, одна модель у RAM, обмеження контексту) застосунок вмикає сам — налаштовувати нічого не треба.
 
 ## Приватність
 

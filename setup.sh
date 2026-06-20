@@ -12,23 +12,31 @@ if [ "$(uname -m)" != "arm64" ]; then
   echo "✗ KobzarAI — лише macOS на Apple Silicon (M1/M2/M3…). Перервано."
   exit 1
 fi
-command -v python3 >/dev/null || { echo "✗ Потрібен python3 (brew install python@3.12)"; exit 1; }
 
 REPO="$(cd "$(dirname "$0")" && pwd)"
 PANEL_DIR="$HOME/.local/kobzarai"
 TTS_DIR="$HOME/.local/styletts2-ua-server"
 
-# 2. Ollama
-if ! command -v ollama >/dev/null; then
-  if command -v brew >/dev/null; then echo "→ Встановлюю Ollama…"; brew install ollama
-  else echo "⚠ Немає Ollama й Homebrew — постав Ollama вручну: https://ollama.com"; fi
+# 2. Залежності — ставимо самі, щоб користувач нічого не готував руками.
+#    Homebrew (може спитати пароль Mac — це нормально), Python 3.12, Ollama.
+if ! command -v brew >/dev/null; then
+  echo "→ Немає Homebrew — встановлюю (може запитати пароль Mac)…"
+  /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+  for p in /opt/homebrew/bin/brew /usr/local/bin/brew; do [ -x "$p" ] && eval "$("$p" shellenv)"; done
 fi
+command -v brew >/dev/null || { echo "✗ Homebrew не встановився. Постав вручну: https://brew.sh, потім запусти ./setup.sh знову."; exit 1; }
+
+PY="$(brew --prefix)/opt/python@3.12/bin/python3.12"
+if [ ! -x "$PY" ]; then echo "→ Встановлюю Python 3.12…"; brew install python@3.12; fi
+[ -x "$PY" ] || PY="python3"                       # фолбек на системний
+
+command -v ollama >/dev/null || { echo "→ Встановлюю Ollama…"; brew install ollama; }
 
 # 3. Панель
 echo "→ Панель → $PANEL_DIR"
 mkdir -p "$PANEL_DIR"
 cp "$REPO/panel/panel.py" "$REPO/panel/make_icon.py" "$PANEL_DIR/"
-python3 -m venv "$PANEL_DIR/.venv"
+"$PY" -m venv "$PANEL_DIR/.venv"
 "$PANEL_DIR/.venv/bin/pip" install -q --upgrade pip
 "$PANEL_DIR/.venv/bin/pip" install -q -r "$REPO/panel/requirements.txt"
 
@@ -36,7 +44,7 @@ python3 -m venv "$PANEL_DIR/.venv"
 echo "→ TTS-сервер → $TTS_DIR (тягне torch — буде довго)"
 mkdir -p "$TTS_DIR/voices"
 cp "$REPO/tts-server/server.py" "$REPO/tts-server/start-tts.sh" "$REPO/tts-server/requirements.txt" "$TTS_DIR/"
-python3 -m venv "$TTS_DIR/.venv"
+"$PY" -m venv "$TTS_DIR/.venv"
 "$TTS_DIR/.venv/bin/pip" install -q --upgrade pip
 "$TTS_DIR/.venv/bin/pip" install -q -r "$TTS_DIR/requirements.txt"
 echo "→ Ресурси нормалізації (nltk для g2p_en)…"
@@ -104,10 +112,9 @@ cat <<EOF
 
 ✓ Готово. KobzarAI.app → $APP
 
-Лишилось:
-  1) Хоча б одна модель Ollama:   ollama pull qwen3:4b
-  2) (опц.) моделі на зовнішньому SSD:   export KOBZARAI_DISK="/Volumes/ТвійSSD"
-  3) Запусти KobzarAI з Launchpad (або open "$APP").
-  4) При першому старті дай дозвіл Accessibility (хоткеї + читання виділеного):
-     Системні налаштування → Конфіденційність і безпека → Доступність → +KobzarAI
+Далі — два кроки мишкою:
+  1) Запусти KobzarAI з Launchpad.
+  2) Коли macOS попросить — дозволь Accessibility (для хоткеїв і читання виділеного).
+
+Модель завантажиш кнопкою в самому застосунку. Все інше теж у меню — терміналу більше не треба.
 EOF
