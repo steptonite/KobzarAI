@@ -4,7 +4,7 @@
 
 `macOS · Apple Silicon` &nbsp;•&nbsp; `офлайн` &nbsp;•&nbsp; `українська` &nbsp;•&nbsp; `MIT`
 
-[![Превʼю KobzarAI](media/poster.png)](media/preview.mp4)
+https://github.com/user-attachments/assets/f9051aa5-fbd5-4335-b7f2-872babf68f73
 
 > [!IMPORTANT]
 > Працює лише на **Apple Silicon** (M1/M2/M3…) — застосунок нативний (Cocoa/Quartz через pyobjc), на Intel/Windows/Linux не запуститься. Тестовано на MacBook Air M2 (8 ГБ).
