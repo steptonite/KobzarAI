@@ -14,17 +14,20 @@ import json, time, urllib.request, urllib.error, os, datetime, subprocess
 
 OLLAMA = "http://127.0.0.1:11434"
 OUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
-NUM_PREDICT = 320          # стеля токенів на відповідь (щоб бенч не тривав годинами на CPU)
+NUM_PREDICT = int(os.environ.get("BENCH_NUM_PREDICT", "320"))  # стеля токенів
 TIMEOUT = 300
+# Вимкнути reasoning ("думання") у qwen3 тощо: BENCH_NOTHINK=1
+NOTHINK = os.environ.get("BENCH_NOTHINK", "") == "1"
 
-# Кандидати (текстові; vision/embed не сюди). Прибери/додай за смаком.
-MODELS = [
+# Кандидати. Перевизнач через BENCH_MODELS="a,b,c".
+_DEFAULT_MODELS = [
     "gemma3:1b",
     "hf.co/INSAIT-Institute/MamayLM-Gemma-3-4B-IT-v1.0-GGUF:Q4_K_M",
     "gemma3:4b",
     "qwen3:4b",
     "huihui_ai/qwen3-abliterated:4b",
 ]
+MODELS = os.environ.get("BENCH_MODELS", "").split(",") if os.environ.get("BENCH_MODELS") else _DEFAULT_MODELS
 
 # Сценарії: (id, категорія, промпт, що перевіряємо очима)
 PROMPTS = [
@@ -62,11 +65,14 @@ PROMPTS = [
 
 
 def gen(model, prompt):
-    body = json.dumps({
+    payload = {
         "model": model, "prompt": prompt, "stream": False,
         "keep_alive": "2m",
         "options": {"num_predict": NUM_PREDICT, "temperature": 0.4},
-    }).encode()
+    }
+    if NOTHINK:
+        payload["think"] = False   # Ollama: глушить <think> у reasoning-моделей
+    body = json.dumps(payload).encode()
     req = urllib.request.Request(f"{OLLAMA}/api/generate", body,
                                  {"Content-Type": "application/json"})
     t0 = time.time()
@@ -105,7 +111,7 @@ def unload(model):
 
 def main():
     os.makedirs(OUT_DIR, exist_ok=True)
-    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M")
+    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M") + ("_nothink" if NOTHINK else "")
     results = {}   # model -> {prompt_id -> metrics}
     ram = {}
 

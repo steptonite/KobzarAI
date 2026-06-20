@@ -106,7 +106,22 @@ _UA_LETTER = {
 _READ_AS_WORD = {"НАТО", "ЮНЕСКО", "ЗНО", "ВНЗ", "СНІД", "ДОТ", "ДзвО"}
 _SYM = {"%": " відсотків", "№": " номер ", "§": " параграф ", "&": " і ",
         "₴": " гривень", "$": " доларів", "€": " євро", "°": " градусів",
-        "/": " слеш ", "@": " ет ", "#": " решітка ", "_": " ", "~": " тильда "}
+        "/": " слеш ", "@": " ет ", "_": " ", "~": " ",
+        "=": " дорівнює ", "+": " плюс ", "×": " помножити ", "÷": " поділити ",
+        "±": " плюс-мінус ", "…": ".", "•": ". ", "→": " ", "←": " ", "—": ", "}
+
+
+# модель пише markdown — приберемо розмітку, лишимо чистий текст для озвучки
+def strip_markdown(t):
+    t = re.sub(r"```.*?```", " ", t, flags=re.S)          # блоки коду
+    t = re.sub(r"`([^`]*)`", r"\1", t)                    # інлайн-код
+    t = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", t)        # [текст](url) -> текст
+    t = re.sub(r"[*]{1,3}([^*]+)[*]{1,3}", r"\1", t)      # **жирний**/*курсив*
+    t = re.sub(r"(?m)^\s{0,3}#{1,6}\s*", "", t)           # # заголовки
+    t = re.sub(r"(?m)^\s*[-*+]\s+", "", t)                # маркери списку
+    t = re.sub(r"(?m)^\s*>\s?", "", t)                    # цитати
+    t = t.replace("*", "").replace("`", "")               # залишкові зірочки/беки
+    return t
 
 
 def _spell_abbr(m):
@@ -123,12 +138,23 @@ def _num_word(m):
         return m.group()
 
 
+def _num_decimal(m):
+    # 2.3 / 2,3 -> "два кома три" (крапка/кома в числі вимовляється)
+    a, b = re.split(r"[.,]", m.group(), maxsplit=1)
+    try:
+        return num2words(int(a), lang="uk") + " кома " + num2words(int(b), lang="uk")
+    except Exception:
+        return m.group()
+
+
 def verbalize_ua(t):
     for s, r in _SYM.items():
         t = t.replace(s, r)
     # 2-5 великих кириличних літер поспіль -> читати по літерах (ДПА -> де-пе-а)
     t = re.sub(r"\b[А-ЯҐЄІЇ]{2,5}\b", _spell_abbr, t)
-    # цілі числа -> слова (роки/кількості); десяткові читаються частинами
+    # десяткові ПЕРШІ (інакше \d+ зʼїсть крапку): 2.3 -> два кома три
+    t = re.sub(r"\d+[.,]\d+", _num_decimal, t)
+    # цілі числа -> слова
     t = re.sub(r"\d+", _num_word, t)
     return t
 
@@ -151,9 +177,49 @@ def split_to_parts(text, group=True):
     return parts
 
 
-def _ua_array(text, kind, style, speed):
-    """Синтез укр -> float32 numpy @24k, або None."""
+def _fade_edges(wav, ms=12):
+    """Лінійний fade-in/out по краях сегмента → прибирає КЛІК на стиках
+    (тверда склейка хвиль давала стрибок амплітуди = «скрип/кріп»)."""
+    n = int(SAMPLE_RATE * ms / 1000.0)
+    if wav.size < 2 * n or n < 1:
+        return wav
+    ramp = np.linspace(0.0, 1.0, n, dtype="float32")
+    wav = wav.copy()
+    wav[:n] *= ramp
+    wav[-n:] *= ramp[::-1]
+    return wav
+
+
+def _trim_quiet(wav, thr=0.012, pad_ms=8):
+    """Зрізати тихий «холодний старт» istftnet на краях сегмента —
+    саме там сидить низьке «джуу»/«блюмк». Лишаємо невеликий запас."""
+    idx = np.where(np.abs(wav) > thr)[0]
+    if idx.size == 0:
+        return wav
+    pad = int(SAMPLE_RATE * pad_ms / 1000.0)
+    a = max(0, idx[0] - pad)
+    b = min(wav.size, idx[-1] + pad)
+    return wav[a:b]
+
+
+_HP_SOS = None
+
+
+def _highpass(wav, cut=65.0):
+    """Прибрати DC + суб-бас гул (низьке «джуу») — не чіпає голос."""
+    global _HP_SOS
+    if _HP_SOS is None:
+        from scipy.signal import butter
+        _HP_SOS = butter(2, cut / (SAMPLE_RATE / 2.0), btype="high", output="sos")
+    from scipy.signal import sosfilt
+    return sosfilt(_HP_SOS, wav).astype("float32")
+
+
+def _ua_array(text, kind, style, speed, pause=0.15):
+    """Синтез укр -> float32 numpy @24k, або None.
+    pause — секунди тиші МІЖ реченнями (керована «дихалка», плавна склейка)."""
     model = get_model(kind)
+    sil = np.zeros(int(max(0.0, pause) * SAMPLE_RATE), dtype="float32")
     result = []
     for t in split_to_parts(text):
         t = t.strip().replace('"', "")
@@ -170,15 +236,20 @@ def _ua_array(text, kind, style, speed):
         ps = ipa(t)
         if ps:
             tokens = model.tokenizer.encode(ps)
-            wav = model(tokens, speed=speed, s_prev=style)
+            wav = model(tokens, speed=speed, s_prev=style).cpu().numpy().astype("float32")
+            wav = _trim_quiet(wav)              # зрізати холодний старт vocoder'а
+            wav = _fade_edges(wav)              # згладити краї → без кліку на стику
+            if result and sil.size:
+                result.append(sil)              # тиша лише МІЖ частинами, не на кінці
             result.append(wav)
     if not result:
         return None
-    return torch.concatenate(result).cpu().numpy().astype("float32")
+    out = np.concatenate(result).astype("float32")
+    return _highpass(out)                       # DC + суб-бас гул геть
 
 
-def synth_ua(text, kind, style, speed):
-    audio = _ua_array(text, kind, style, speed)
+def synth_ua(text, kind, style, speed, pause=0.15):
+    audio = _ua_array(text, kind, style, speed, pause)
     if audio is None:
         return None
     buf = io.BytesIO()
@@ -253,6 +324,21 @@ def _spell_en_acronym(w):
     return "-".join(_EN_LETTER.get(c.lower(), c) for c in w)
 
 
+def _en_word_like(w):
+    """ALL-CAPS: читати як слово (NVIDIA, LEGO, NASA) чи по літерах (TTS, API)?
+    Чиста евристика вимовності — БЕЗ списків слів (їх безмежно).
+    Слово, якщо: довжина>=4, є голосні (>=25%), нема 4+ приголосних поспіль."""
+    lw = w.lower()
+    if len(w) < 4:                              # US, API, GPU, USB -> по літерах
+        return False
+    vowels = sum(c in "aeiouy" for c in lw)
+    if vowels == 0 or vowels / len(lw) < 0.25:  # HTML, HTTP, NVMe -> по літерах
+        return False
+    if re.search(r"[^aeiouy]{4,}", lw):         # 4+ приголосних поспіль = не вимовне
+        return False
+    return True
+
+
 def _en_phonetic(text):
     """Англ. слова -> укр. фонетика. Суцільні великі (акроніми) -> по літерах."""
     g = _g2p_lazy()
@@ -271,9 +357,9 @@ def _en_phonetic(text):
 def latin_to_ua(text):
     def repl(m):
         w = m.group()
-        if len(w) >= 2 and w.isupper():       # TTS, API, RAM -> по літерах
-            return _spell_en_acronym(w)
-        return _en_phonetic(w)
+        if len(w) >= 2 and w.isupper() and not _en_word_like(w):
+            return _spell_en_acronym(w)       # TTS, API, USB -> по літерах
+        return _en_phonetic(w)                # слова + вимовні скорочення (NVIDIA) -> як слово
     return re.sub(r"[A-Za-z]+", repl, text)
 
 
@@ -336,15 +422,21 @@ def speech():
         speed = float(data.get("speed", 1.0))
     except (TypeError, ValueError):
         speed = 1.0
+    try:
+        pause = float(data.get("pause", 0.15))
+    except (TypeError, ValueError):
+        pause = 0.15
     if not text:
         return jsonify({"error": "empty input"}), 400
     ua_speed = max(0.7, min(1.3, speed))
-    # Один голос StyleTTS2: латиниця -> якісна укр-фонетика (g2p), кирилиця -> вербалізація.
+    pause = max(0.0, min(0.6, pause))
+    # Прибрати markdown -> латиниця в укр-фонетику (g2p) -> вербалізація кирилиці.
+    text = strip_markdown(text)
     text = latin_to_ua(text)
     try:
         with _lock:
             kind, style = resolve_voice(data.get("voice"))
-            out = synth_ua(text, kind, style, ua_speed)
+            out = synth_ua(text, kind, style, ua_speed, pause)
             if out is None:
                 return jsonify({"error": "nothing to synthesize"}), 400
             mime, audio = out
