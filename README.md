@@ -4,7 +4,7 @@
 
 `macOS · Apple Silicon` &nbsp;•&nbsp; `офлайн` &nbsp;•&nbsp; `українська` &nbsp;•&nbsp; `MIT`
 
-<video src="https://github.com/steptonite/KobzarAI/raw/main/media/preview.mp4" controls width="720"></video>
+[![Превʼю KobzarAI](media/poster.png)](media/preview.mp4)
 
 > [!IMPORTANT]
 > Працює лише на **Apple Silicon** (M1/M2/M3…) — застосунок нативний (Cocoa/Quartz через pyobjc), на Intel/Windows/Linux не запуститься. Тестовано на MacBook Air M2 (8 ГБ).
