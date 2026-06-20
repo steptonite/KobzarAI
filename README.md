@@ -8,6 +8,8 @@
 
 ![icon](panel/icon.png)
 
+**[▶ Превʼю](media/preview.mp4)** — реалтайм-озвучка, поки модель пише.
+
 > [!IMPORTANT]
 > **Тільки macOS на Apple Silicon** (M1/M2/M3…). Залежить від нативного Cocoa/Quartz (pyobjc) — на Intel-Mac, Windows чи Linux не працює.
 > Розроблено й протестовано на MacBook Air M2 (8 ГБ) — звідси аскетизм щодо памʼяті по всьому стеку.
