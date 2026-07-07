@@ -3,23 +3,30 @@
 import os, subprocess, tempfile, threading, time, urllib.request, json, shlex, re
 import rumps
 import objc
-from AppKit import (NSImage, NSSound, NSWindow, NSPanel, NSBackingStoreBuffered,
+from AppKit import (NSImage, NSSound, NSWindow, NSBackingStoreBuffered,
     NSWindowStyleMaskTitled, NSWindowStyleMaskClosable, NSWindowStyleMaskResizable,
-    NSWindowStyleMaskFullSizeContentView, NSWindowStyleMaskUtilityWindow,
+    NSWindowStyleMaskFullSizeContentView,
     NSMenu, NSMenuItem,
     NSTextField, NSPopUpButton, NSButton, NSView, NSApp, NSColor, NSSlider,
     NSImageSymbolConfiguration, NSApplication, NSWorkspace, NSPasteboard, NSScreen, NSClipView,
-    NSTabView, NSTabViewItem, NSSegmentedControl, NSScrollView, NSTextView, NSFont, NSAttributedString,
+    NSScrollView, NSTextView, NSFont, NSAttributedString,
     NSMutableAttributedString, NSTextTab, NSRightTextAlignment, NSBox,
     NSVisualEffectView, NSVisualEffectBlendingModeBehindWindow, NSVisualEffectStateActive,
-    NSVisualEffectMaterialHUDWindow, NSVisualEffectMaterialPopover,
-    NSVisualEffectMaterialWindowBackground, NSFloatingWindowLevel,
+    NSVisualEffectMaterialHUDWindow,
+    NSVisualEffectMaterialWindowBackground, NSVisualEffectMaterialUnderWindowBackground,
     NSOpenPanel, NSAppearance, NSMutableParagraphStyle, NSColorSpace,
     NSFontAttributeName, NSForegroundColorAttributeName, NSParagraphStyleAttributeName,
     NSBackgroundColorAttributeName, NSTrackingArea,
-    NSTableView, NSTableColumn, NSProgressIndicator, NSSliderCell, NSBezierPath)
+    NSTableView, NSTableColumn, NSProgressIndicator, NSSliderCell, NSBezierPath,
+    NSAlert, NSStackView, NSSwitch, NSLayoutConstraint,
+    NSToolbar, NSToolbarItem, NSWindowToolbarStyleUnified,
+    NSUserInterfaceLayoutOrientationVertical, NSUserInterfaceLayoutOrientationHorizontal,
+    NSLayoutAttributeLeading, NSLayoutAttributeCenterY)
 from Foundation import (NSObject, NSAutoreleasePool, NSMakeRect, NSMakeRange,
-    NSMakeSize, NSProcessInfo)
+    NSMakeSize, NSMakePoint, NSProcessInfo, NSInsetRect, NSTimer)
+from AppKit import NSTableRowView, NSViewBoundsDidChangeNotification, NSWindowStyleMaskMiniaturizable
+from Foundation import NSNotificationCenter, NSIndexSet
+from Quartz import CAGradientLayer, CATransaction
 from WebKit import WKWebView, WKWebViewConfiguration
 from PyObjCTools import AppHelper
 
@@ -37,8 +44,12 @@ def models_dir():
 START_OLLAMA = os.path.expanduser("~/.ollama/start-ollama.sh")
 TTS_DIR = os.path.expanduser("~/.local/styletts2-ua-server")
 TTS_PORT = 5050
+TTS_MAX_CHARS = 200000          # стеля довжини озвучення (~ глава книги); раніше 6000 мовчки різало великі тексти
+TTS_GROUP_CHARS = 200           # таргет довжини спана синтезу на сервері (server: дефолт 20=Cherry); більший = менше стиків, менше рваності
 OLLAMA_HOST = "127.0.0.1:11434"
 VOICES = ["Артем Окороков", "Анастасія Павленко", "Денис Денисенко", "filatov"]
+VOICE_LABELS = {"filatov": "Filatov"}          # серверні ключі lowercase → людський підпис
+def voice_label(v): return VOICE_LABELS.get(v, v)
 CONFIG = os.path.expanduser("~/.local/kobzarai/config.json")
 
 # дефолтні хоткеї: лише ⌃⌥ (виділене) і ⌃⌥⇧ (пауза); буфер/стоп — порожні
@@ -52,6 +63,11 @@ HK_LABELS = [("speak_sel", "Озвучити виділене"), ("speak_clip", 
              ("tts_pause", "Пауза / продовжити"), ("tts_stop", "Стоп")]
 _MOD_SYM = {"ctrl": "⌃", "alt": "⌥", "shift": "⇧", "cmd": "⌘"}
 _MOD_ORDER = ["ctrl", "alt", "shift", "cmd"]
+# side-aware модифікатори: токени lcmd/rcmd/... зберігають ФІЗИЧНУ сторону (ліва/права).
+# _MOD_BASE зводить їх до бази для порядку/символу; _MOD_SIDE — маркер сторони у показі.
+_MOD_BASE = {"lctrl": "ctrl", "rctrl": "ctrl", "lalt": "alt", "ralt": "alt",
+             "lshift": "shift", "rshift": "shift", "lcmd": "cmd", "rcmd": "cmd"}
+_MOD_SIDE = {"l": "ᴸ", "r": "ᴿ"}
 _KC2CHAR = {0:"A",1:"S",2:"D",3:"F",4:"H",5:"G",6:"Z",7:"X",8:"C",9:"V",11:"B",12:"Q",
     13:"W",14:"E",15:"R",16:"Y",17:"T",18:"1",19:"2",20:"3",21:"4",22:"6",23:"5",24:"=",
     25:"9",26:"7",27:"-",28:"8",29:"0",30:"]",31:"O",32:"U",33:"[",34:"I",35:"P",37:"L",
@@ -62,7 +78,25 @@ _KC2CHAR = {0:"A",1:"S",2:"D",3:"F",4:"H",5:"G",6:"Z",7:"X",8:"C",9:"V",11:"B",1
 def fmt_hotkey(v):
     if not v:
         return "—"
-    s = "".join(_MOD_SYM[m] for m in _MOD_ORDER if m in v.get("mods", []))
+    mods = v.get("mods", [])
+    bybase = {}                              # база → конкретний токен (sided чи ні)
+    for m in mods:
+        bybase[_MOD_BASE.get(m, m)] = m
+    s = ""
+    side = None
+    for base in _MOD_ORDER:
+        if base in bybase:
+            tok = bybase[base]
+            sym = _MOD_SYM[base]
+            if tok != base:                  # sided токен (lcmd/rcmd…)
+                cur_side = _MOD_SIDE.get(tok[0], "")
+                if side is None:
+                    side = cur_side
+                elif side != cur_side:
+                    side = "mixed"
+            s += sym
+    if side and side != "mixed":
+        s += side
     kc = v.get("keycode")
     if kc is not None:
         s += _KC2CHAR.get(kc, f"·{kc}")
@@ -100,10 +134,90 @@ def load_cfg():
         return {}
 
 
+_cfg_lock = threading.Lock()
+
+
 def save_cfg(d):
+    # Атомарно (tmp → os.replace) і під локом: конфіг пишуть і головний потік,
+    # і потік хоткей-тапа — прямий open("w") давав шанс обірваного/змішаного файлу,
+    # який load_cfg мовчки читав як {} → «настройки злетіли».
     try:
-        with open(CONFIG, "w") as f:
-            json.dump(d, f, ensure_ascii=False, indent=2)
+        with _cfg_lock:
+            tmp = CONFIG + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(d, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, CONFIG)
+    except Exception:
+        pass
+
+
+# ── збереження чатів: локально, по файлу на чат (відкривається у Finder) ──
+DEFAULT_CHATS_DIR = os.path.expanduser("~/Documents/KobzarAI/Чати")
+
+
+def chats_dir():
+    """Тека де лежать чати (UI-налаштування, інакше дефолт у Документах)."""
+    try:
+        return load_cfg().get("chats_dir") or DEFAULT_CHATS_DIR
+    except Exception:
+        return DEFAULT_CHATS_DIR
+
+
+def _safe_name(s):
+    s = re.sub(r'[/\\:\n\r\t]+', '_', str(s)).strip()
+    return (s or "chat")[:60]
+
+
+def load_chats():
+    """Підняти всі чати з теки (відсортовані за часом, новіші зверху)."""
+    d = chats_dir(); out = []
+    try:
+        files = [f for f in os.listdir(d) if f.endswith(".json")]
+    except Exception:
+        return out
+    for f in files:
+        try:
+            with open(os.path.join(d, f)) as fp:
+                j = json.load(fp)
+            if isinstance(j, dict) and isinstance(j.get("history"), list):
+                j.setdefault("title", "Чат")
+                j.setdefault("ts", os.path.getmtime(os.path.join(d, f)))
+                j.setdefault("id", str(int(j["ts"] * 1000)))   # стабільна ідентичність рядка
+                j["_file"] = f
+                out.append(j)
+        except Exception:
+            pass
+    out.sort(key=lambda s: s.get("ts", 0), reverse=True)
+    return out
+
+
+def save_chat(sess):
+    """Записати один чат у його файл (створює теку за потреби)."""
+    d = chats_dir()
+    try:
+        os.makedirs(d, exist_ok=True)
+    except Exception:
+        return
+    if not sess.get("id"):
+        sess["id"] = str(int(time.time() * 1000))
+    fname = sess.get("_file") or ("%s-%s.json" % (sess["id"], _safe_name(sess.get("title", ""))))
+    sess["_file"] = fname
+    try:
+        with open(os.path.join(d, fname), "w") as fp:
+            json.dump({"id": sess["id"], "title": sess.get("title", ""),
+                       "ts": sess.get("ts", time.time()),
+                       "history": sess.get("history", [])},
+                      fp, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def delete_chat_file(sess):
+    f = sess.get("_file")
+    if not f:
+        return
+    try:
+        os.remove(os.path.join(chats_dir(), f))
     except Exception:
         pass
 
@@ -121,6 +235,54 @@ def tts_mode():
 # ── авто-вивантаження TTS з RAM по простою (оптимізація для 8 ГБ) ──
 TTS_IDLE_LABELS = ["Ніколи", "2 хв", "5 хв", "10 хв", "30 хв"]
 TTS_IDLE_MIN    = [0, 2, 5, 10, 30]
+
+
+_AUDIO_OUT_CACHE = None
+
+def audio_outputs():
+    """Список (назва, UID) пристроїв ВИВОДУ через CoreAudio (ctypes, детерміновано).
+    UID годиться напряму для NSSound.setPlaybackDeviceIdentifier_. [] якщо збій."""
+    global _AUDIO_OUT_CACHE
+    if _AUDIO_OUT_CACHE is not None:
+        return _AUDIO_OUT_CACHE
+    res = []
+    try:
+        import ctypes, ctypes.util, struct
+        ca = ctypes.CDLL(ctypes.util.find_library("CoreAudio"))
+        cf = ctypes.CDLL(ctypes.util.find_library("CoreFoundation"))
+        fcc = lambda s: struct.unpack(">I", s.encode())[0]
+        class AOPA(ctypes.Structure):
+            _fields_ = [("s", ctypes.c_uint32), ("sc", ctypes.c_uint32), ("e", ctypes.c_uint32)]
+        SYS = 1; GLOB = fcc('glob'); OUT = fcc('outp')
+        cf.CFStringGetCString.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_long, ctypes.c_uint32]
+        def cfstr(ref):
+            if not ref: return None
+            buf = ctypes.create_string_buffer(512)
+            if cf.CFStringGetCString(ref, buf, 512, 0x08000100):
+                return buf.value.decode("utf-8", "replace")
+            return None
+        A = lambda sel, sc=GLOB: AOPA(fcc(sel), sc, 0)
+        sz = ctypes.c_uint32(0)
+        ca.AudioObjectGetPropertyDataSize(SYS, ctypes.byref(A('dev#')), 0, None, ctypes.byref(sz))
+        n = sz.value // 4
+        arr = (ctypes.c_uint32 * n)()
+        ca.AudioObjectGetPropertyData(SYS, ctypes.byref(A('dev#')), 0, None, ctypes.byref(sz), arr)
+        for did in arr:
+            s2 = ctypes.c_uint32(0)
+            ca.AudioObjectGetPropertyDataSize(did, ctypes.byref(A('stm#', OUT)), 0, None, ctypes.byref(s2))
+            if not s2.value:                                  # без output-стрімів → не пристрій виводу
+                continue
+            nref = ctypes.c_void_p(0); us = ctypes.c_uint32(8)
+            ca.AudioObjectGetPropertyData(did, ctypes.byref(A('lnam', OUT)), 0, None, ctypes.byref(us), ctypes.byref(nref))
+            uref = ctypes.c_void_p(0); us2 = ctypes.c_uint32(8)
+            ca.AudioObjectGetPropertyData(did, ctypes.byref(A('uid ', OUT)), 0, None, ctypes.byref(us2), ctypes.byref(uref))
+            nm, uid = cfstr(nref), cfstr(uref)
+            if nm and uid:
+                res.append((nm, uid))
+    except Exception:
+        res = []
+    _AUDIO_OUT_CACHE = res
+    return res
 
 
 def tts_idle_min():
@@ -203,8 +365,28 @@ def ollama_up():
 
 
 def tts_up():
-    try: urllib.request.urlopen(f"http://127.0.0.1:{TTS_PORT}/health", timeout=2); return True
+    # timeout=2 давав хибні «впав»: під swap синтез на single-Flask тримає потік і
+    # /health не встигав за 2с → watchdog піднімав 2-й сервер. 4с — запас на лаг.
+    try: urllib.request.urlopen(f"http://127.0.0.1:{TTS_PORT}/health", timeout=4); return True
     except Exception: return False
+
+
+def notify(title, subtitle="", message=""):
+    return   # ПУШІ ВИМКНЕНО (рішення користувача): жодних системних сповіщень
+    """Системне сповіщення через osascript. Чому не інакше:
+    • rumps.notification спирається на стару NSUserNotification, яку на macOS 26 прибрано;
+    • нативний UNUserNotificationCenter віддає UNErrorDomain Code=1 (not-allowed), бо апка
+      підписана ad-hoc і збирається вручну — система не авторизує її як клієнта сповіщень.
+    osascript 'display notification' доставляється завжди (іде під «Редактор скриптів»)."""
+    def esc(s): return str(s).replace("\\", "\\\\").replace('"', '\\"')
+    scr = f'display notification "{esc(message)}" with title "{esc(title)}"'
+    if subtitle: scr += f' subtitle "{esc(subtitle)}"'
+    try: subprocess.Popen(["osascript", "-e", scr])
+    except Exception: pass
+
+
+# ПУШІ ВИМКНЕНО глобально — rumps.notification теж глушимо (нічого не показуємо)
+rumps.notification = lambda *a, **k: None
 
 
 def split_sentences(text, maxlen=240):
@@ -316,9 +498,58 @@ def ram_size(line):
     return m.group(1) if m else ""
 
 
+# TTS_ACTIVE_PEAK_GB — виміряно vmmap 01.07.2026: реальний Physical Footprint (не ps/RSS,
+# той GPU/Metal-памʼять не бачить) під час серії активних синтезів на CPU StyleTTS2
+# стабілізується на цій стелі. RAM_SAFETY_MARGIN_GB — запас під macOS+фонові апки
+# (Claude/браузер/Telegram і т.п.), емпірично з живих спостережень тиску на 8ГБ.
+TTS_ACTIVE_PEAK_GB = 4.0
+RAM_SAFETY_MARGIN_GB = 2.0
+
+
+def total_ram_gb():
+    try: return int(sh("sysctl -n hw.memsize 2>/dev/null")) / (1024 ** 3)
+    except Exception: return 8.0   # безпечний дефолт для цього класу машин
+
+
+def _size_to_gb(sz):
+    m = re.match(r"([\d.,]+)\s?([GM])B", sz or "")
+    if not m: return 0.0
+    n = float(m.group(1).replace(",", "."))
+    return n if m.group(2) == "G" else n / 1024.0
+
+
+def realtime_ram_risk():
+    """Текст попередження якщо режим «Наживо» (Ollama генерує + TTS озвучує ОДНОЧАСНО)
+    ймовірно не влізе в RAM без важкого свопу, або None якщо все ок / модель не завантажена."""
+    model_gb = sum(_size_to_gb(ram_size(l)) for l in ps_loaded())
+    if model_gb <= 0:
+        return None                 # нема завантаженої моделі зараз — нема чого рахувати
+    need = model_gb + TTS_ACTIVE_PEAK_GB + RAM_SAFETY_MARGIN_GB
+    total = total_ram_gb()
+    if need <= total:
+        return None
+    return (f"Тісно з RAM: модель ~{model_gb:.1f} ГБ + жива озвучка ~{TTS_ACTIVE_PEAK_GB:.0f} ГБ "
+            f"на {total:.0f} ГБ разом — може гальмувати. Спробуй меншу модель або режим «Швидко».")
+
+
 def list_models():
     out = sh(f"{OLLAMA} list 2>/dev/null")
     return [l.split()[0] for l in out.splitlines()[1:] if l.strip()]
+
+
+def model_size(name):
+    """Розмір моделі на диску з `ollama list` (напр. «4.1 GB»). Порожньо якщо нема."""
+    if not name or name.startswith("("):
+        return ""
+    try:
+        out = sh(f"{OLLAMA} list 2>/dev/null")
+        for l in out.splitlines()[1:]:
+            p = l.split()
+            if p and p[0] == name and len(p) >= 4:
+                return ("%s %s" % (p[2], p[3])).replace("GB", "ГБ").replace("MB", "МБ")
+    except Exception:
+        pass
+    return ""
 
 
 # Куратований fallback під 8ГБ RAM — коли офіційний ендпоінт недоступний.
@@ -349,7 +580,7 @@ def human_size(nbytes):
     if not nbytes:
         return "?"
     g = nbytes / 1e9
-    return f"{g:.2f} GB" if g >= 1 else f"{nbytes / 1e6:.0f} MB"
+    return f"{g:.1f} ГБ" if g >= 1 else f"{nbytes / 1e6:.0f} МБ"
 
 
 def short_num(n):
@@ -424,7 +655,9 @@ def fetch_hf_repo_size(repo):
             parts = [sz for nm, sz in ggufs.items() if q.lower() in nm.lower() and sz]
             if parts:
                 return sum(parts), q
-        nm = min(ggufs, key=lambda k: ggufs[k] or 1e18)
+        sizes = sorted(ggufs.values())
+        med = sizes[len(sizes) // 2]
+        nm = next(k for k, v in ggufs.items() if v == med)
         return ggufs[nm], None
     except Exception:
         return None, None
@@ -434,17 +667,26 @@ def fetch_hf_repo_size(repo):
 CHAT_PREF = ("qwen3:4b-instruct-2507-q4_K_M", "gemma3:4b",
              "hf.co/INSAIT-Institute/MamayLM-Gemma-3-4B-IT-v1.0-GGUF:Q4_K_M", "gemma3:1b")
 
+# ембед/реранк-моделі — НЕ чат: /api/chat на них дає 400. bge-m3 не містить «embed»
+# у назві, тож ловимо за коренями сімейств явно.
+_EMBED_MARKERS = ("embed", "bge", "nomic-embed", "gte", "e5-", "mxbai", "snowflake-arctic-embed",
+                  "reranker", "rerank")
+
+
+def is_embed_model(name):
+    low = (name or "").lower()
+    return any(m in low for m in _EMBED_MARKERS)
+
 
 def pick_chat_model(models):
     for p in CHAT_PREF:
         if p in models:
             return p
     for m in models:
-        low = m.lower()
-        if "embed" in low or "vl" in low:
+        if is_embed_model(m) or "vl" in m.lower():
             continue
         return m
-    return models[0] if models else None
+    return None                        # лише ембед/vl-моделі → чат-моделі НЕМА (не брешемо)
 
 
 # --- глобальні хоткеї через CGEventTap (модифікаторні «тапи» + комбо mod+клавіша) ---
@@ -479,7 +721,9 @@ class Hotkeys(threading.Thread):
     def _record(self, mods, keycode):
         act = self.recording; self.recording = None
         cfg = load_cfg(); hk = cfg.get("hotkeys", dict(DEFAULT_HOTKEYS))
-        hk[act] = {"mods": [m for m in _MOD_ORDER if m in mods], "keycode": keycode}
+        # mods — side-aware токени (lcmd/rcmd/…); упорядкувати за базою ⌃⌥⇧⌘
+        ordered = sorted(mods, key=lambda m: _MOD_ORDER.index(_MOD_BASE.get(m, m)))
+        hk[act] = {"mods": ordered, "keycode": keycode}
         cfg["hotkeys"] = hk; save_cfg(cfg); self.reload()
 
     def run(self):
@@ -492,14 +736,47 @@ class Hotkeys(threading.Thread):
             kCGEventFlagMaskCommand)
         MB = {"ctrl": kCGEventFlagMaskControl, "alt": kCGEventFlagMaskAlternate,
               "shift": kCGEventFlagMaskShift, "cmd": kCGEventFlagMaskCommand}
+        # device-dependent біти у CGEvent flags розрізняють ФІЗИЧНУ сторону клавіші
+        # (NX_DEVICE*KEYMASK). Generic-маски вище кажуть лише «cmd натиснуто», не яка.
+        DEV = {"lctrl": 0x00000001, "rctrl": 0x00002000,
+               "lshift": 0x00000002, "rshift": 0x00000004,
+               "lcmd": 0x00000008, "rcmd": 0x00000010,
+               "lalt": 0x00000020, "ralt": 0x00000040}
 
-        def mods_of(flags):
+        def sides_of(flags):                  # натиснуті side-токени (lcmd/rcmd/…)
+            return frozenset(n for n, b in DEV.items() if flags & b)
+
+        def gens_of(flags):                   # натиснуті бази (cmd/ctrl/…), будь-яка сторона
             return frozenset(n for n, b in MB.items() if flags & b)
+
+        def hit(bm, flags):
+            """Чи відповідає набір модифікаторів bm (sided або generic токени) поточним
+            flags. Бази мусять збігтися ТОЧНО (без зайвих), а sided-токен вимагає саме
+            своєї фізичної сторони. Generic-токен (cmd) матчить будь-яку сторону —
+            бекснап-сумісність зі старими дефолтами ⌃⌥."""
+            req_bases = frozenset(_MOD_BASE.get(t, t) for t in bm)
+            if gens_of(flags) != req_bases:
+                return False
+            sd = sides_of(flags)
+            return all((t not in DEV) or (t in sd) for t in bm)
+
+        def hit_peak(bm, peak):
+            """Те саме, але для modifier-only (порівняння з накопиченим peak side-токенів)."""
+            req_bases = frozenset(_MOD_BASE.get(t, t) for t in bm)
+            if frozenset(_MOD_BASE.get(t, t) for t in peak) != req_bases:
+                return False
+            return all((t not in DEV) or (t in peak) for t in bm)
 
         def cb(proxy, etype, event, refcon):
             try:
                 flags = CGEventGetFlags(event)
-                m = mods_of(flags)
+                s = sides_of(flags)                        # side-токени (lcmd/rcmd/…)
+                if etype in _MOUSE_DOWN:
+                    # клік миші із затиснутими модифікаторами (⌃⌥-drag, mod+клік) —
+                    # епізод «брудний», modifier-only хоткей на відпусканні НЕ стріляє
+                    if self._active:
+                        self._dirty = True
+                    return event
                 if etype == kCGEventKeyDown:
                     kc = CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode)
                     if kc in (54, 55, 56, 57, 58, 59, 60, 61, 62, 63):  # самі модифікатори — ігнор
@@ -507,18 +784,18 @@ class Hotkeys(threading.Thread):
                     if self.recording is not None:
                         if kc == 53:                      # Esc -> скасувати запис
                             self.recording = None
-                        elif m:                            # комбо mod+клавіша
-                            self._record(m, kc)
+                        elif s:                            # комбо mod+клавіша (sided)
+                            self._record(s, kc)
                         return event
                     self._dirty = True
                     for act, (bm, bkc) in self.binds.items():
-                        if bkc is not None and bkc == kc and bm == m:
+                        if bkc is not None and bkc == kc and hit(bm, flags):
                             self._fire(act); break
                 elif etype == kCGEventFlagsChanged:
-                    if m:
+                    if s:
                         if not self._active:
                             self._active = True; self._dirty = False; self._episode = set()
-                        self._episode |= set(m)
+                        self._episode |= set(s)
                     else:                                  # всі модифікатори відпущені
                         if self._active:
                             peak = frozenset(self._episode); self._active = False
@@ -527,13 +804,17 @@ class Hotkeys(threading.Thread):
                                     self._record(peak, None)
                                 else:
                                     for act, (bm, bkc) in self.binds.items():
-                                        if bkc is None and bm == peak:
+                                        if bkc is None and hit_peak(bm, peak):
                                             self._fire(act); break
             except Exception:
                 pass
             return event
 
-        mask = CGEventMaskBit(kCGEventFlagsChanged) | CGEventMaskBit(kCGEventKeyDown)
+        # mouse-down типи (CGEventType): left=1, right=3, other=25 — щоб бачити
+        # mod+клік і не стріляти modifier-only хоткеєм на відпусканні модифікаторів
+        _MOUSE_DOWN = (1, 3, 25)
+        mask = (CGEventMaskBit(kCGEventFlagsChanged) | CGEventMaskBit(kCGEventKeyDown)
+                | CGEventMaskBit(1) | CGEventMaskBit(3) | CGEventMaskBit(25))
         tap = None
         while not tap:                       # tap створиться лише з дозволом Accessibility
             tap = CGEventTapCreate(kCGSessionEventTap, kCGHeadInsertEventTap,
@@ -547,7 +828,7 @@ class Hotkeys(threading.Thread):
 
 
 def make_glass(frame, material):
-    """Liquid-Glass підкладка (NSVisualEffectView, blur за вікном)."""
+    """Старе скло (NSVisualEffectView, blur за вікном) — ФОЛБЕК для < macOS 26."""
     fx = NSVisualEffectView.alloc().initWithFrame_(frame)
     fx.setMaterial_(material)
     fx.setBlendingMode_(NSVisualEffectBlendingModeBehindWindow)
@@ -556,8 +837,24 @@ def make_glass(frame, material):
     return fx
 
 
+# --- СПРАВЖНЄ Liquid Glass (macOS 26 Tahoe): NSGlassEffectView ---
+# Дає реальне заломлення десктопу по контуру (лінза), а не плаский матовий blur.
+try:
+    NSGlassEffectView = objc.lookUpClass("NSGlassEffectView")
+    # Regular(0) = ЗВИЧАЙНЕ матове скло Apple (як віджети/сайдбари): прозорість + ОБЕРЕЖНИЙ
+    # блюр + лінза/переливи. Clear(1) — надто прозоре, без блюру (текст під вікном читається).
+    _GLASS_REGULAR = 0
+    _HAS_GLASS = True
+except Exception:
+    NSGlassEffectView = None
+    _HAS_GLASS = False
+
+
 THEMES = ["Авто", "Світла", "Темна"]
 TOKEN_OPTS = ["512", "1024", "2048", "4096"]
+CTX_OPTS = ["2048", "4096", "8192", "16384"]   # розмір контекстного вікна (num_ctx)
+# імена message-хендлерів webview-налаштувань (міст HTML→Python). Розширюється стадіями.
+SETTINGS_MSGS = ["ui"]
 
 # акценти = системна палітра Apple (як мітки у Finder): збалансовані, самі адаптуються до теми
 ACCENT_SEL = {
@@ -574,6 +871,8 @@ ACCENT_ORDER = ["Синій", "Червоний", "Помаранч", "Жовт�
 
 # --- сітка (єдиний дизайн-код для всіх вкладок) ---
 LP_M   = 18    # зовнішнє поле вкладки
+LP_SBW = 196   # ширина бічного списку чатів
+LP_SBG = 14    # відступ між списком і колонкою чату
 LP_PAD = 14    # внутрішнє поле картки
 LP_ROW = 34    # висота рядка
 LP_SEC = 16    # відстань між секціями
@@ -622,7 +921,7 @@ body{font:14px/1.55 -apple-system,"SF Pro Text",system-ui,sans-serif;
 #log{padding:18px 16px 24px;display:flex;flex-direction:column;gap:14px;}
 .row{display:flex;}
 .row.user{justify-content:flex-end;}
-.row.ai{justify-content:flex-start;}
+.row.ai{flex-direction:column;align-items:flex-start;}
 .bubble{max-width:80%;padding:11px 15px;border-radius:18px;overflow-wrap:anywhere;}
 .user .bubble{background:var(--accent);color:#fff;border-bottom-right-radius:6px;}
 .ai .bubble{background:__AIBG__;color:__FG__;border-bottom-left-radius:6px;}
@@ -635,6 +934,18 @@ body{font:14px/1.55 -apple-system,"SF Pro Text",system-ui,sans-serif;
 .bubble h2,.bubble h3{margin:8px 0 4px;font-size:1.05em;font-weight:600;}
 .bubble ul,.bubble ol{margin:7px 0;padding-left:20px;} .bubble li{margin:3px 0;}
 .bubble a{color:var(--accent);}
+.hit{margin:0 0 12px;padding-bottom:11px;border-bottom:1px solid __CODEBG__;}
+.hit:last-child{border-bottom:none;padding-bottom:0;}
+.hitttl{display:inline-block;margin-bottom:4px;color:var(--accent);font-weight:600;
+  text-decoration:none;cursor:pointer;}
+.hitttl:hover{text-decoration:underline;}
+.hitxt{opacity:.82;white-space:pre-wrap;overflow-wrap:anywhere;}
+.acts{display:flex;gap:6px;margin:5px 0 0 4px;}
+.act{cursor:pointer;color:__MUTED__;display:inline-flex;align-items:center;gap:4px;
+  font:11.5px/1 -apple-system,system-ui,sans-serif;background:none;border:0;
+  padding:3px 6px;border-radius:7px;-webkit-user-select:none;transition:color .12s,background .12s;}
+.act:hover{background:__CODEBG__;color:__FG__;}
+.act svg{width:13px;height:13px;}
 .empty{color:__MUTED__;text-align:center;margin-top:48px;font-size:13px;}
 .typing{display:inline-block;width:7px;height:15px;background:__MUTED__;
   border-radius:2px;vertical-align:-2px;animation:bl 1s steps(2,end) infinite;}
@@ -665,21 +976,129 @@ function empty(){clearAll();var d=document.createElement('div');d.className='emp
   d.textContent='Порожній чат. Напиши запит нижче.';log.appendChild(d);}
 function row(cls){rmE();var r=document.createElement('div');r.className='row '+cls;
   r.innerHTML='<div class="bubble"></div>';log.appendChild(r);return r.firstChild;}
+var CP='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';
+var SPK='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5 6 9H2v6h4l5 4z"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/><path d="M19 5a9 9 0 0 1 0 14"/></svg>';
+var RG='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/></svg>';
+function bridge(name,txt){try{if(window.webkit&&webkit.messageHandlers&&webkit.messageHandlers[name]){webkit.messageHandlers[name].postMessage(txt);}}catch(e){}}
+function copyText(txt,btn){var done=false;
+  try{if(window.webkit&&webkit.messageHandlers&&webkit.messageHandlers.copy){
+    webkit.messageHandlers.copy.postMessage(txt);done=true;}}catch(e){}
+  if(!done){var ta=document.createElement('textarea');ta.value=txt;
+    ta.style.position='fixed';ta.style.opacity='0';document.body.appendChild(ta);ta.focus();ta.select();
+    try{document.execCommand('copy');}catch(e){}document.body.removeChild(ta);}
+  var l=btn.querySelector('.lbl');if(l){var o=l.textContent;l.textContent='Скопійовано';
+    setTimeout(function(){l.textContent=o;},1200);}}
+function mkAct(icon,label,title,fn){var b=document.createElement('button');
+  b.className='act';b.title=title;b.innerHTML=icon+'<span class="lbl">'+label+'</span>';
+  b.onclick=fn;return b;}
+function addActs(rowEl,raw){
+  var old=rowEl.querySelector('.acts');if(old)old.remove();   // не дублювати при regen
+  var a=document.createElement('div');a.className='acts';
+  var c=mkAct(CP,'Копіювати','Копіювати',function(){copyText(raw,c);});
+  var s=mkAct(SPK,'Озвучити','Озвучити відповідь',function(){bridge('speak',raw);});
+  var r=mkAct(RG,'Ще раз','Перегенерувати відповідь',function(){bridge('regen',raw);});
+  a.appendChild(c);a.appendChild(s);a.appendChild(r);rowEl.appendChild(a);}
 function addUser(t){row('user').textContent=t;scr();}
-function addAI(t){row('ai').innerHTML=md(t);scr();}
+function addAI(t){var b=row('ai');b.innerHTML=md(t);if(t)addActs(b.parentNode,t);scr();}
 function aiStart(){var b=row('ai');b.innerHTML='<span class="typing"></span>';aiB=b;aiRaw='';scr();}
 function aiAppend(c){if(!aiB)aiStart();aiRaw+=c;aiB.innerHTML=md(aiRaw);scr();}
-function aiEnd(){if(aiB&&!aiRaw)aiB.innerHTML='<em style="opacity:.55">порожньо</em>';aiB=null;aiRaw='';}
+function aiEnd(){if(aiB){if(!aiRaw)aiB.innerHTML='<em style="opacity:.55">порожньо</em>';
+  else addActs(aiB.parentNode,aiRaw);}aiB=null;aiRaw='';}
+var hitPaths=[];
+function openHit(el){var p=hitPaths[+el.getAttribute('data-i')];if(p)bridge('open',p);}
+function aiHits(arr){if(!aiB)aiStart();aiRaw='';hitPaths=[];var h='';
+  for(var i=0;i<arr.length;i++){var it=arr[i];hitPaths.push(it.path||'');
+    var ttl=it.path?('<a class="hitttl" href="#" data-i="'+i+'" title="'+esc(it.path)+
+      '" onclick="openHit(this);return false;">'+esc(it.tag)+'</a>'):
+      ('<div class="hitttl" style="cursor:default">'+esc(it.tag)+'</div>');
+    h+='<div class="hit">'+ttl+'<div class="hitxt">'+esc(it.text||'')+'</div></div>';
+    aiRaw+=it.tag+'\n'+(it.text||'')+'\n\n';}
+  aiB.innerHTML=h;if(arr.length)addActs(aiB.parentNode,aiRaw);scr();}
 function note(t){rmE();var d=document.createElement('div');d.className='empty';
   d.textContent=t;log.appendChild(d);scr();}
 </script></body></html>"""
 
 
+_UKR_MON = ["січ", "лют", "бер", "кві", "тра", "чер",
+            "лип", "сер", "вер", "жов", "лис", "гру"]
+
+def rel_time(ts):
+    """Короткий підпис часу для списку чатів (як «Topics» у Cherry): сьогодні→HH:MM,
+    учора→«вчора», інакше→«D міс»."""
+    if not ts:
+        return ""
+    now = time.localtime(); t = time.localtime(ts)
+    if (now.tm_year, now.tm_yday) == (t.tm_year, t.tm_yday):
+        return time.strftime("%H:%M", t)
+    yest = time.localtime(time.mktime(now) - 86400)
+    if (yest.tm_year, yest.tm_yday) == (t.tm_year, t.tm_yday):
+        return "вчора"
+    return "%d %s" % (t.tm_mday, _UKR_MON[t.tm_mon - 1])
+
+
+class ChatRowView(NSTableRowView):
+    """Рядок списку чатів з округлою підсвіткою активного (як Cherry/Finder),
+    без інверсії тексту — підписи лишаються темними й читабельними.
+    Підсвітку малюємо В background (а не drawSelectionInRect_), бо таблиця
+    в стилі None не дасть AppKit малювати ні власну заливку, ні обведену
+    menu-target рамку на правий клік (інакше двоїлося)."""
+    def setSelected_(self, flag):
+        # стиль None → AppKit НЕ перемальовує row-view при зміні виділення →
+        # стара підсвітка лишається (привид), нова не малюється. Форсуємо перемальов.
+        objc.super(ChatRowView, self).setSelected_(flag)
+        self.setNeedsDisplay_(True)
+
+    def drawBackgroundInRect_(self, rect):
+        if not self.isSelected():
+            return
+        inset = NSInsetRect(self.bounds(), 4, 1)
+        path = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(inset, 7, 7)
+        NSColor.controlAccentColor().colorWithAlphaComponent_(0.18).set()
+        path.fill()
+
+
+class _ChatTable(NSTableView):
+    """Таблиця списку чатів. Перевизначаємо menuForEvent_: повертаємо меню напряму,
+    БЕЗ super → AppKit не малює власне синє menu-target кільце на правий клік (двоїлося
+    з нашою округлою підсвіткою). Рядок-ціль запамʼятовуємо в делегата (_ctx_row),
+    щоб не змінювати активний чат самим лише правим кліком."""
+    def menuForEvent_(self, event):
+        p = self.convertPoint_fromView_(event.locationInWindow(), None)
+        r = self.rowAtPoint_(p)
+        d = self.delegate()
+        try: d._ctx_row = int(r)
+        except Exception: pass
+        return self.menu() if r >= 0 else None
+
+
+class _LibRowView(NSTableRowView):
+    """Рядок бібліотеки моделей: заокруглена вставлена підсвітка (як ChatRowView,
+    єдиний UI), трохи помітніша (0.22) + тонка рамка-акцент. Текст лишається
+    темним (без інверсії) → читабельний і центрований коміркою."""
+    def setSelected_(self, flag):
+        # стиль None → AppKit не інвалідує row-view при зміні вибору → форсуємо
+        # перемальов, інакше підсвітка двоїться (стара лишається) / не показується.
+        objc.super(_LibRowView, self).setSelected_(flag)
+        self.setNeedsDisplay_(True)
+
+    def drawBackgroundInRect_(self, rect):
+        if not self.isSelected():
+            return
+        inset = NSInsetRect(self.bounds(), 4, 2)
+        path = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(inset, 7, 7)
+        NSColor.controlAccentColor().colorWithAlphaComponent_(0.22).set()
+        path.fill()
+        NSColor.controlAccentColor().colorWithAlphaComponent_(0.55).set()
+        path.setLineWidth_(1.0); path.stroke()
+
+
 def chat_html():
     dark = is_dark()
-    pal = dict(BG="#1c1c1e", FG="#e9e9ec", AIBG="#2c2c2e", PREBG="#00000059",
+    # BG=transparent → вебвʼю не малює білий квадрат, світиться матерія/прозорість вікна;
+    # бульбашки лишаються зі своєю заливкою (iMessage на матовому фоні)
+    pal = dict(BG="transparent", FG="#e9e9ec", AIBG="#3a3a3c", PREBG="#00000059",
                CODEBG="#ffffff1f", MUTED="#98989d") if dark else \
-          dict(BG="#ffffff", FG="#1d1d20", AIBG="#f2f2f5", PREBG="#0000000d",
+          dict(BG="transparent", FG="#1d1d20", AIBG="#e7e7ec", PREBG="#0000000d",
                CODEBG="#00000012", MUTED="#8a8a8e")
     pal["ACCENT"] = accent_hex()
     html = _CHAT_HTML
@@ -740,10 +1159,245 @@ class _AccentSlider(NSSlider):
         return _AccentSliderCell
 
 
+class SlidingSegment(NSView):
+    """Сегмент-перемикач з акцентною плашкою, що ЇЗДИТЬ між пунктами (ease-out,
+    таймер) — як у HTML-мокапі. Нативний NSSegmentedControl так не вміє: лише
+    перемикає підсвітку без руху. Плашку Й текст малюємо разом у drawRect (текст
+    ЗАВЖДИ над плашкою), тож обраний підпис не ховається. Обраний текст білий,
+    решта — secondary. Drop-in: selectedSegment()/setSelectedSegment_/setTarget_action_."""
+    def initWithLabels_frame_(self, labels, fr):
+        self = objc.super(SlidingSegment, self).initWithFrame_(fr)
+        if self is None: return None
+        self._labels = list(labels)
+        self._sel = 0
+        self._target = None
+        self._action = None
+        self._font = NSFont.systemFontOfSize_weight_(12.5, 0.30)
+        self._pill_x = None                       # анімований центр плашки (None → центр обраного)
+        self._anim = None                         # {"from","to","t0","dur"}
+        self._timer = None
+        self._track = True
+        self.setWantsLayer_(True)
+        # капсула повністю заокруглена (radius=h/2) → узгоджується зі скляною
+        # капсулою unified-тулбара та пігулкою всередині (юзер: «форма не співвідноситься»)
+        self.layer().setCornerRadius_(max(1.0, fr.size.height / 2.0))
+        self._paint_track()
+        return self
+
+    @objc.python_method
+    def _paint_track(self):
+        # track=True → заглиблений контейнер (інлайн-контрол); False → плаваючі вкладки.
+        # tint під тему + тонка обводка → НЕ зливається зі склом на макс. прозорості
+        # (узгоджено зі слайдер-картками Голосу).
+        if self._track:
+            dark = "Dark" in str(self.effectiveAppearance().name())
+            bg = (NSColor.colorWithRed_green_blue_alpha_(1, 1, 1, 0.10) if dark
+                  else NSColor.colorWithRed_green_blue_alpha_(0, 0, 0, 0.07))
+            self.layer().setBackgroundColor_(bg.CGColor())
+            self.layer().setBorderWidth_(1.0)
+            self.layer().setBorderColor_(NSColor.separatorColor().CGColor())
+        else:
+            self.layer().setBackgroundColor_(NSColor.clearColor().CGColor())
+            self.layer().setBorderWidth_(0.0)
+
+    def setTrackless_(self, on):
+        self._track = not on
+        self._paint_track()
+        self.setNeedsDisplay_(True)
+
+    @objc.python_method
+    def _segw(self):
+        return self.bounds().size.width / max(1, len(self._labels))
+
+    @objc.python_method
+    def _center(self, i):
+        w = self._segw()
+        return w * i + w / 2.0
+
+    def setTarget_action_(self, t, a):
+        self._target = t; self._action = a
+
+    def selectedSegment(self):
+        return self._sel
+
+    def setSelectedSegment_(self, i):
+        self._sel = max(0, min(len(self._labels) - 1, int(i)))
+        if self._anim is None:        # не збивати плашку, що ЇДЕ (tabChanged повторно сетить сегмент)
+            self._pill_x = self._center(self._sel)
+        self.setNeedsDisplay_(True)
+
+    def reaccent(self):
+        self.setNeedsDisplay_(True)
+
+    def drawRect_(self, r):
+        if self._pill_x is None:
+            self._pill_x = self._center(self._sel)
+        h = self.bounds().size.height
+        w = self._segw()
+        pw = w - 6; ph = h - 6
+        rad = ph / 2.0                       # повністю кругла пігулка (нести в круглій капсулі)
+        pill = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+            NSMakeRect(self._pill_x - pw / 2.0, 3, pw, ph), rad, rad)
+        # неактивне вікно → плашка сіра, обраний текст темний (як нативні контроли)
+        win = self.window()
+        key = (win is None) or win.isKeyWindow()
+        if key:
+            accent_color().setFill(); sel_col = NSColor.whiteColor()
+        else:
+            NSColor.unemphasizedSelectedContentBackgroundColor().setFill()
+            sel_col = NSColor.labelColor()
+        pill.fill()
+        for i, lab in enumerate(self._labels):
+            col = sel_col if i == self._sel else NSColor.secondaryLabelColor()
+            s = NSAttributedString.alloc().initWithString_attributes_(
+                lab, {NSForegroundColorAttributeName: col, NSFontAttributeName: self._font})
+            sz = s.size()
+            s.drawAtPoint_(NSMakePoint(w * i + (w - sz.width) / 2.0, (h - sz.height) / 2.0))
+
+    def mouseDown_(self, e):
+        p = self.convertPoint_fromView_(e.locationInWindow(), None)
+        i = max(0, min(len(self._labels) - 1, int(p.x / self._segw())))
+        if i == self._sel:
+            return
+        self._sel = i
+        frm = self._pill_x if self._pill_x is not None else self._center(i)
+        self._anim = {"from": frm, "to": self._center(i), "t0": time.time(), "dur": 0.34}
+        if self._timer is None:
+            self._timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+                1 / 60.0, self, "_tick:", None, True)
+        self.setNeedsDisplay_(True)
+        if self._target is not None and self._action is not None:
+            NSApp.sendAction_to_from_(self._action, self._target, self)
+
+    def _tick_(self, timer):
+        a = self._anim
+        if a is None:
+            if self._timer is not None:
+                self._timer.invalidate(); self._timer = None
+            return
+        t = (time.time() - a["t0"]) / a["dur"]
+        if t >= 1.0:
+            self._pill_x = a["to"]; self._anim = None
+            if self._timer is not None:
+                self._timer.invalidate(); self._timer = None
+        else:
+            ease = 1.0 - (1.0 - t) ** 3            # ease-out cubic
+            self._pill_x = a["from"] + (a["to"] - a["from"]) * ease
+        self.setNeedsDisplay_(True)
+
+
+class _DangerButton(NSButton):
+    """Кнопка небезпечної дії: червоний текст завжди, повний червоний фон + білий
+    текст на час натиску (mouseDown тримає трекінг до відпускання)."""
+    @objc.python_method
+    def _paint(self, pressed):
+        col = NSColor.whiteColor() if pressed else NSColor.systemRedColor()
+        try:
+            a = NSAttributedString.alloc().initWithString_attributes_(
+                getattr(self, "_danger_title", self.title()),
+                {NSForegroundColorAttributeName: col,
+                 NSFontAttributeName: NSFont.systemFontOfSize_(13.0)})
+            self.setAttributedTitle_(a)
+        except Exception: pass
+        try: self.setBezelColor_(NSColor.systemRedColor() if pressed else None)
+        except Exception: pass
+
+    def mouseDown_(self, e):
+        self._paint(True)
+        objc.super(_DangerButton, self).mouseDown_(e)
+        self._paint(False)
+
+
+FADE_TOP = 30.0   # висота смуги згасання зверху (px)
+
+
 class _TopClipView(NSClipView):
     """Перевернутий clip-view: документ пришпилений до ВЕРХУ, скрол стартує згори."""
     def isFlipped(self):
         return True
+
+
+class _FadeScrollView(NSScrollView):
+    """Скрол з делікатним fade зверху — як macOS 26 System Settings: контент
+    РОЗЧИНЯЄТЬСЯ у скло на верхній кромці viewport, під плаваючим скляним сегментом
+    (Загальні/Голос/Моделі/Чат), а не обрізається грубою лінією.
+
+    Правильна реалізація (попередня не їхала за скролом): маска-градієнт на шарі
+    clip-view, її origin.y ЩОРАЗУ дорівнює bounds.origin.y → смуга згасання завжди
+    стоїть на верху ВИДИМОЇ області, а не пливе з контентом. Слухаємо
+    NSViewBoundsDidChangeNotification (зветься на КОЖЕН скрол, на відміну від tile()).
+    Implicit-анімація шару вимкнена (CATransaction) — інакше маска «здоганяє» скрол
+    ривками. Маска лише на clip → скролбар (сусідній сабвʼю, поза clip) не згасає."""
+    def initWithFrame_(self, fr):
+        self = objc.super(_FadeScrollView, self).initWithFrame_(fr)
+        if self is None:
+            return None
+        self._fade_mask = None
+        self._fade_obs = False
+        return self
+
+    @objc.python_method
+    def _ensure_observer(self):
+        cv = self.contentView()
+        if cv is None or self._fade_obs:
+            return
+        cv.setPostsBoundsChangedNotifications_(True)
+        NSNotificationCenter.defaultCenter().addObserver_selector_name_object_(
+            self, "_fadeBoundsChanged:", NSViewBoundsDidChangeNotification, cv)
+        self._fade_obs = True
+
+    @objc.python_method
+    def _ensure_mask(self):
+        cv = self.contentView()
+        if cv is None:
+            return None
+        cv.setWantsLayer_(True)
+        if self._fade_mask is None:
+            g = CAGradientLayer.layer()
+            clear = NSColor.clearColor().CGColor()
+            solid = NSColor.blackColor().CGColor()   # масці важлива лише alpha, не колір
+            # 4 стопи: прозоро за тулбаром → плавна поява одразу під його нижньою кромкою
+            g.setColors_([clear, clear, solid, solid])
+            g.setStartPoint_((0.5, 0.0))             # flipped-layer: (0)=верх viewport=верх вікна
+            g.setEndPoint_((0.5, 1.0))               # (1)=низ
+            self._fade_mask = g
+            if cv.layer() is not None:
+                cv.layer().setMask_(g)
+        return self._fade_mask
+
+    @objc.python_method
+    def _layout_mask(self):
+        cv = self.contentView()
+        g = self._ensure_mask()
+        if cv is None or g is None or cv.layer() is None:
+            return
+        if cv.layer().mask() is not g:               # шар clip міг перестворитись
+            cv.layer().setMask_(g)
+        b = cv.bounds()
+        h = b.size.height; w = b.size.width
+        if h <= 0:
+            return
+        # T = висота тулбара (верхній contentInset): контент під ним прихований (clear),
+        # виринаючи з-під нижньої кромки — плавно проявляється протягом ~22px.
+        try: T = float(self.contentInsets().top)
+        except Exception: T = 0.0
+        top_clear = max(0.0, T - 6.0)                # майже до нижньої кромки тулбара — прозоро
+        solid_at = T + 22.0                          # повна непрозорість трохи нижче кромки
+        l1 = min(0.999, top_clear / h)
+        l2 = min(1.0, solid_at / h)
+        if l2 <= l1: l2 = min(1.0, l1 + 0.001)
+        CATransaction.begin(); CATransaction.setDisableActions_(True)
+        g.setLocations_([0.0, l1, l2, 1.0])
+        g.setFrame_(NSMakeRect(b.origin.x, b.origin.y, w, h))
+        CATransaction.commit()
+
+    def _fadeBoundsChanged_(self, note):
+        self._layout_mask()
+
+    def tile(self):
+        objc.super(_FadeScrollView, self).tile()
+        self._ensure_observer()
+        self._layout_mask()
 
 
 class _FocusRing(NSView):
@@ -783,10 +1437,14 @@ class _HoverButton(NSButton):
         if self is None: return None
         self._hovcolor = None
         self._area = None
+        self._danger = False
         return self
 
     def setHoverColor_(self, c):
         self._hovcolor = c
+
+    def setDangerFlash_(self, f):
+        self._danger = bool(f)         # натиск → заливка червоним + біла іконка (як .trash:active в мокапі)
 
     def updateTrackingAreas(self):
         if self._area is not None:
@@ -808,6 +1466,28 @@ class _HoverButton(NSButton):
         self.setAlphaValue_(1.0)
 
     def mouseDown_(self, e):
+        if self._danger:
+            # .btn.danger:active — заливка червона + БІЛИЙ текст (і іконка). Текст міняємо
+            # окремо: contentTintColor не перебиває колір attributed-заголовка (черв. текст
+            # «Видалити KobzarAI…» лишався б червоним на червоному).
+            prev = self.attributedTitle()
+            try:
+                self.setBezelColor_(NSColor.systemRedColor())
+                self.setContentTintColor_(NSColor.whiteColor())
+                s = str(self.title())
+                if s:
+                    white = NSAttributedString.alloc().initWithString_attributes_(
+                        s, {NSForegroundColorAttributeName: NSColor.whiteColor(),
+                            NSFontAttributeName: self.font() or NSFont.systemFontOfSize_(0)})
+                    self.setAttributedTitle_(white)
+            except Exception: pass
+            objc.super(_HoverButton, self).mouseDown_(e)   # блокує до відпускання
+            try:
+                self.setBezelColor_(None)
+                self.setContentTintColor_(None)
+                if prev is not None: self.setAttributedTitle_(prev)
+            except Exception: pass
+            return
         self.setAlphaValue_(0.45)          # тактильний фідбек натиску
         objc.super(_HoverButton, self).mouseDown_(e)
         self.setAlphaValue_(1.0)
@@ -826,6 +1506,14 @@ class SettingsWindow(NSObject):
         self.is_open = False
         self.hk_btns = {}
         self.token_pop = None
+        self.tok_num = None
+        self.tok_idx = 2
+        self.ctx_num = None
+        self.ctx_idx = 1
+        self.transp_val = None
+        self._scroll = None
+        self._cards = []
+        self._pages = {}
         self.auto_oll = None
         self.auto_tts = None
         self.tts_mode = None
@@ -863,18 +1551,38 @@ class SettingsWindow(NSObject):
         self.web = None
         self._web_ready = False
         self._js_queue = []
+        # вікно налаштувань (окремий WKWebView, рендерить ui/settings.html)
+        self.set_web = None
+        self._settings_ready = False
         self.chat_view = None
         self.chat_input = None
         self.chat_pill = None
         self.chat_sc = None
         self.chat_stop = None
         self.chat_model_lbl = None
-        self.hist_pop = None
+        self.chat_size_lbl = None
+        self.chat_dot = None
+        self.hist_tbl = None
+        self._chat_host = None      # повноекранний контейнер чату (поза скрол-сторінками)
+        self._chat_built = False
+        # База знань (self-contained RAG): вмикається тумблером у пігулці, індексує
+        # обрану теку через Ollama bge-m3. Ліниво — щоб апка не падала, коли kb.py/модель
+        # відсутні (портативність: у того, хто просто завантажив, це просто вимкнено).
+        _kbcfg = load_cfg()
+        self.kb_on = bool(_kbcfg.get("kb_on", False))
+        self.kb_folder = _kbcfg.get("kb_folder", "") or ""
+        self.kb_index = _kbcfg.get("kb_index", "") or ""   # шлях до ГОТОВОГО індексу (read-only)
+        self._kb = None
+        self._kb_busy = False
         self.autospeak = None
         self.autospeak_on = False
+        self._ram_warned = False    # попередження про тісний RAM у режимі «Наживо» — раз за сесію
+        self._pull_cancel = threading.Event()   # кооп. скасування завантаження моделі (HTTP-стрім, не subprocess)
         self.accent_swatch = None
         self.send_btn = None
-        self.sessions = [{"title": "Чат 1", "history": []}]
+        self._generating = False
+        self.sessions = load_chats() or [
+            {"title": "Чат 1", "history": [], "ts": time.time(), "id": str(int(time.time() * 1000))}]
         self.cur = 0
         return self
 
@@ -885,8 +1593,16 @@ class SettingsWindow(NSObject):
         self.is_open = True
         self.panel._update_activation()
         self._install_edit_menu()
-        NSApp.activateIgnoringOtherApps_(True)
-        self.win.makeKeyAndOrderFront_(None)
+        if os.environ.get("KOBZARAI_ONSCREEN"):     # тест-хук: над десктопом, без крадіжки фокуса (перевірка скла)
+            self.win.setFrameOrigin_((80.0, 120.0))
+            self.win.orderFront_(None)
+        elif os.environ.get("KOBZARAI_NOACTIVATE"):   # тест-хук: рендер за екраном, без крадіжки фокуса
+            fr = self.win.frame()
+            self.win.setFrameOrigin_((-4000.0, 200.0))
+            self.win.makeKeyAndOrderFront_(None)
+        else:
+            NSApp.activateIgnoringOtherApps_(True)
+            self.win.makeKeyAndOrderFront_(None)
         if os.environ.get("KOBZARAI_FOCUS_PULL") and self.pull_field is not None:
             self.win.makeFirstResponder_(self.pull_field)   # тест-хук: фокус у поле
         else:
@@ -926,15 +1642,93 @@ class SettingsWindow(NSObject):
 
     @objc.python_method
     def select_tab(self, i):
-        if self.tabs is not None:
-            try: self.tabs.selectTabViewItemAtIndex_(i)
-            except Exception: pass
+        i = max(0, min(3, int(i)))
         if self.seg is not None:
             try: self.seg.setSelectedSegment_(i)
             except Exception: pass
+        if i == 3:                      # Чат — не скрол-сторінка, а повноекранний сплит
+            self._show_chat_page()
+            return
+        # інші вкладки: ховаємо чат, повертаємо скрол зі сторінками
+        if self._chat_host is not None:
+            self._chat_host.setHidden_(True)
+        if self._scroll is not None:
+            self._scroll.setHidden_(False)
+        keys = ["general", "voice", "models"]
+        builders = [self._page_general, self._page_voice, self._page_models]
+        key = keys[i]
+        page = self._pages.get(key)
+        if page is None:
+            page = builders[i](); self._pages[key] = page
+        self._set_page(page, key)
 
+    @objc.python_method
+    def _show_chat_page(self):
+        """Чат займає весь простір під тулбаром (сайдбар+транскрипт+пігулка),
+        НЕ скролиться як сторінка → ховаємо скрол, показуємо власний контейнер."""
+        if self._scroll is not None:
+            self._scroll.setHidden_(True)
+        ch = self._chat_host
+        if ch is None:
+            host = self._host
+            try:    r = self.win.contentLayoutRect()      # площа під unified-тулбаром
+            except Exception: r = host.bounds()
+            ch = NSView.alloc().initWithFrame_(r)
+            ch.setAutoresizingMask_(18)                   # ширина+висота тягнуться, верх. відступ фікс
+            host.addSubview_(ch)
+            self._chat_host = ch
+            # будуємо після того, як контейнер отримав реальний фрейм
+            self._build_chat(ch, r.size.width, r.size.height)
+            self._chat_built = True
+            self._refresh_chat_header()
+        else:
+            ch.setHidden_(False)
+            self._refresh_chat_header()
+
+    @objc.python_method
+    def _set_page(self, page, key=None):
+        sc = self._scroll
+        # Кеш обгорток: пересоздання wrap+констрейнтів на КОЖНЕ перемикання давало
+        # повний Auto Layout прохід сторінки → відчутний лаг табів (надто під свопом).
+        # Повторний показ = чистий setDocumentView + реактивація крос-констрейнтів
+        # (вони деактивуються, коли wrap вилітає з ієрархії).
+        wraps = getattr(self, "_wraps", None)
+        if wraps is None:
+            wraps = {}; self._wraps = wraps
+        cached = wraps.get(key)
+        if cached is not None:
+            w, cons = cached
+            sc.setDocumentView_(w)
+            NSLayoutConstraint.activateConstraints_(cons)
+            return
+        # обгортка на всю ширину viewport; контент центрований всередині (стеля 600).
+        # (центрувати вузький documentView напряму в clip-view не можна — NSScrollView
+        #  кладе його в лівий-верх; тому повнорозмірний wrap = documentView.)
+        wrap = self._al(NSView.alloc().init())
+        wrap.addSubview_(page)
+        sc.setDocumentView_(wrap)
+        cv = sc.contentView()
+        wEq = page.widthAnchor().constraintEqualToAnchor_constant_(wrap.widthAnchor(), -48)
+        wEq.setPriority_(750)
+        cons = [
+            wrap.topAnchor().constraintEqualToAnchor_(cv.topAnchor()),
+            wrap.leadingAnchor().constraintEqualToAnchor_(cv.leadingAnchor()),
+            wrap.trailingAnchor().constraintEqualToAnchor_(cv.trailingAnchor()),
+            wrap.widthAnchor().constraintEqualToAnchor_(sc.widthAnchor()),
+            page.topAnchor().constraintEqualToAnchor_constant_(wrap.topAnchor(), 10),
+            page.bottomAnchor().constraintEqualToAnchor_constant_(wrap.bottomAnchor(), -16),
+            page.centerXAnchor().constraintEqualToAnchor_(wrap.centerXAnchor()),
+            wEq]      # без стелі 720 — контент тягнеться за шириною вікна (мінус поле 48)
+        NSLayoutConstraint.activateConstraints_(cons)
+        if key is not None:
+            wraps[key] = (wrap, cons)
+
+    def tabChanged_(self, sender):
+        self.select_tab(sender.selectedSegment())
+
+    # старий сегмент-хендлер (мертвий, на випадок зовнішніх викликів)
     def segChanged_(self, sender):
-        try: self.tabs.selectTabViewItemAtIndex_(sender.selectedSegment())
+        try: self.select_tab(sender.selectedSegment())
         except Exception: pass
 
     # ---------- дрібні фабрики контролів ----------
@@ -959,13 +1753,24 @@ class SettingsWindow(NSObject):
         return f
 
     @objc.python_method
-    def _btn(self, view, title, x, y, w, action, h=28, mask=8, symbol=None, primary=False):
-        b = NSButton.alloc().initWithFrame_(NSMakeRect(x, y, w, h))
+    def _btn(self, view, title, x, y, w, action, h=28, mask=8, symbol=None, primary=False,
+             danger=False, sym_pt=None, sym_w=4):
+        # danger=True → натиск заливає червоним (кнопки видалення в мокапі)
+        # sym_pt → тонший/менший SF-символ (sym_w: вага, 4=regular) — не чіпає інші вкладки
+        cls = _HoverButton if danger else NSButton
+        b = cls.alloc().initWithFrame_(NSMakeRect(x, y, w, h))
         b.setTitle_(title); b.setBezelStyle_(1)
         b.setTarget_(self); b.setAction_(action)
+        if danger: b.setDangerFlash_(True)
         if symbol:
             img = NSImage.imageWithSystemSymbolName_accessibilityDescription_(symbol, title)
             if img:
+                if sym_pt is not None:
+                    try:
+                        cfg = NSImageSymbolConfiguration.configurationWithPointSize_weight_(
+                            float(sym_pt), sym_w)
+                        img = img.imageWithSymbolConfiguration_(cfg) or img
+                    except Exception: pass
                 b.setImage_(img); b.setImagePosition_(2)  # NSImageLeft
         if primary:
             b.setKeyEquivalent_("\r")
@@ -976,48 +1781,62 @@ class SettingsWindow(NSObject):
         return b
 
     @objc.python_method
-    def _ibtn(self, view, symbol, x, y, action, w=30, h=26, mask=8, tip="", color=None):
-        """Компактна іконка-кнопка (SF Symbol). color → мінімальний акцент іконки."""
+    def _ibtn(self, view, symbol, x, y, action, w=30, h=26, mask=8, tip="", color=None,
+              danger=False, sym_pt=None, sym_w=4):
+        """Компактна іконка-кнопка (SF Symbol). color → мінімальний акцент іконки.
+        danger=True → натиск заливає червоним (як кнопки видалення в мокапі).
+        sym_pt → тонший/менший символ (sym_w: вага) — опційно, не чіпає інші виклики."""
         b = _HoverButton.alloc().initWithFrame_(NSMakeRect(x, y, w, h))
         b.setBezelStyle_(1); b.setTitle_("")
         b.setTarget_(self); b.setAction_(action)
         img = NSImage.imageWithSystemSymbolName_accessibilityDescription_(symbol, tip)
         if img:
+            if sym_pt is not None:
+                try:
+                    cfg = NSImageSymbolConfiguration.configurationWithPointSize_weight_(
+                        float(sym_pt), sym_w)
+                    img = img.imageWithSymbolConfiguration_(cfg) or img
+                except Exception: pass
             b.setImage_(img); b.setImagePosition_(1)  # NSImageOnly (template → нейтральний)
         if color is not None:
             b.setHoverColor_(color)        # колір лише на hover, не в спокої
+        if danger:
+            b.setDangerFlash_(True)
         if tip: b.setToolTip_(tip)
         b.setAutoresizingMask_(mask)
         view.addSubview_(b)
         return b
 
     @objc.python_method
-    def _grp(self, view, title, x, top, w):
-        """Сірий group-заголовок над карткою. Повертає y верху картки."""
-        l = self._lbl(view, title, x + 4, top - 15, w, gray=True, h=14, mask=10)
-        l.setFont_(NSFont.systemFontOfSize_(11.0))
-        return top - LP_HDR
-
-    @objc.python_method
-    def _card(self, view, x, top, w, rows, mask=10):
-        """Скляна картка (rounded NSBox) на rows рядків. Повертає (box, top_inner)."""
-        h = 2 * LP_PAD + rows * LP_ROW
-        box = NSBox.alloc().initWithFrame_(NSMakeRect(x, top - h, w, h))
-        box.setBoxType_(4)            # NSBoxCustom
-        box.setTitlePosition_(0)      # NSNoTitle
-        box.setCornerRadius_(10.0)
-        box.setBorderWidth_(1.0)
-        box.setBorderColor_(NSColor.separatorColor())
+    def _token_stepper(self, view, x, y, w, mask=9):
+        """Степер ± «Відповідь, токенів» (як .stepper у мокапі): [−][num][+] у
+        заокругленій плашці. Крокає по TOKEN_OPTS. Стан → self.tok_idx, cfg num_predict."""
+        try: self.tok_idx = TOKEN_OPTS.index(str(load_cfg().get("num_predict", 2048)))
+        except ValueError: self.tok_idx = 2
+        h = 28
+        box = NSBox.alloc().initWithFrame_(NSMakeRect(x, y, w, h))
+        box.setBoxType_(4); box.setTitlePosition_(0); box.setCornerRadius_(7.0)
+        box.setBorderWidth_(1.0); box.setBorderColor_(NSColor.separatorColor())
         box.setFillColor_(NSColor.colorWithWhite_alpha_(0.5, 0.09))
-        box.setAutoresizingMask_(mask)
-        view.addSubview_(box)
-        return box, top
-
-    @objc.python_method
-    def _cy(self, card_top, i, ch):
-        """y (низ) контролю висотою ch у рядку i картки (центрований у рядку)."""
-        bandtop = card_top - LP_PAD - i * LP_ROW
-        return bandtop - (LP_ROW + ch) / 2.0
+        box.setAutoresizingMask_(mask); view.addSubview_(box)
+        bw = 30; nw = w - 2 * bw
+        for tag, sym, bx in ((-1, "−", 0), (1, "+", w - bw)):
+            btn = _HoverButton.alloc().initWithFrame_(NSMakeRect(x + bx, y, bw, h))
+            btn.setBordered_(False); btn.setTitle_(sym)
+            btn.setFont_(NSFont.systemFontOfSize_(16.0))
+            btn.setTag_(tag); btn.setTarget_(self); btn.setAction_("tokStep:")
+            btn.setAutoresizingMask_(mask); view.addSubview_(btn)
+        # вертикальні роздільники навколо числа
+        for sx in (x + bw, x + bw + nw):
+            sep = NSBox.alloc().initWithFrame_(NSMakeRect(sx, y + 4, 1, h - 8))
+            sep.setBoxType_(2); sep.setAutoresizingMask_(mask); view.addSubview_(sep)
+        num = NSTextField.alloc().initWithFrame_(NSMakeRect(x + bw, y + 5, nw, 18))
+        num.setBezeled_(False); num.setDrawsBackground_(False); num.setEditable_(False)
+        num.setSelectable_(False); num.setAlignment_(2)   # center
+        num.setFont_(NSFont.systemFontOfSize_(13.0))
+        num.setStringValue_(TOKEN_OPTS[self.tok_idx])
+        num.setAutoresizingMask_(mask); view.addSubview_(num)
+        self.tok_num = num
 
     @objc.python_method
     def _field(self, view, x, y, w, placeholder="", h=26, mask=10):
@@ -1076,547 +1895,958 @@ class SettingsWindow(NSObject):
         b.setAutoresizingMask_(10)
         view.addSubview_(b)
 
+    # ===================== Auto Layout тулкіт (нативні контроли) =====================
+    # Жодних піксельних координат: NSStackView + констрейнти. Контроли — СИСТЕМНІ
+    # (NSSwitch/NSSlider/NSPopUpButton/NSSegmentedControl) → на macOS 26 = Liquid Glass самі.
+    @objc.python_method
+    def _al(self, v):
+        v.setTranslatesAutoresizingMaskIntoConstraints_(False); return v
+
+    @objc.python_method
+    def _fillx(self, child, parent, inset=0.0):
+        NSLayoutConstraint.activateConstraints_([
+            child.leadingAnchor().constraintEqualToAnchor_constant_(parent.leadingAnchor(), inset),
+            child.trailingAnchor().constraintEqualToAnchor_constant_(parent.trailingAnchor(), -inset)])
+
+    @objc.python_method
+    def _vstack(self, spacing=10):
+        s = self._al(NSStackView.alloc().init())
+        s.setOrientation_(NSUserInterfaceLayoutOrientationVertical)
+        s.setAlignment_(NSLayoutAttributeLeading); s.setSpacing_(spacing)
+        return s
+
+    @objc.python_method
+    def _hstack(self, spacing=8):
+        s = self._al(NSStackView.alloc().init())
+        s.setOrientation_(NSUserInterfaceLayoutOrientationHorizontal)
+        s.setAlignment_(NSLayoutAttributeCenterY); s.setSpacing_(spacing)
+        return s
+
+    @objc.python_method
+    def _albl(self, text, gray=False, size=13.0, bold=False):
+        f = NSTextField.labelWithString_(text)
+        f.setFont_(NSFont.boldSystemFontOfSize_(size) if bold else NSFont.systemFontOfSize_(size))
+        if gray: f.setTextColor_(NSColor.secondaryLabelColor())
+        return self._al(f)
+
+    @objc.python_method
+    def _shadowed(self, f):
+        """No-op (тінь робила гірше — однотонна тінь зливалась із текстом).
+        Читабельність на склі тепер дає молочний tint скла + насиченіший колір
+        заголовків, без тіні. Лишено як прохід-пустушка, щоб не правити виклики."""
+        return f
+
+    @objc.python_method
+    def _keycap_tint(self):
+        # окремий tint для keycap — інакше зливається з карткою (та сама поверхня).
+        # темна тема — світліший лифт; світла — легке затемнення (інсет-клавіша).
+        if self._is_dark():
+            return NSColor.colorWithRed_green_blue_alpha_(1, 1, 1, 0.14)
+        return NSColor.colorWithRed_green_blue_alpha_(0, 0, 0, 0.06)
+
+    @objc.python_method
+    def _cap(self, inner, w=None, h=26.0):
+        """Keycap-капсула довкола клавіш хоткея: клавіша ВЦЕНТРОВАНА обома осями."""
+        box = self._al(NSBox.alloc().init())
+        box.setBoxType_(4); box.setTitlePosition_(0); box.setCornerRadius_(6.0)
+        box.setBorderWidth_(1.0); box.setBorderColor_(NSColor.separatorColor())
+        box.setFillColor_(self._keycap_tint()); self._keycaps = getattr(self, "_keycaps", [])
+        self._keycaps.append(box)
+        box.setContentViewMargins_(NSMakeSize(0, 0))
+        box.setContentView_(inner)
+        NSLayoutConstraint.activateConstraints_([
+            inner.centerXAnchor().constraintEqualToAnchor_(box.centerXAnchor()),
+            inner.centerYAnchor().constraintEqualToAnchor_(box.centerYAnchor()),
+            inner.leadingAnchor().constraintGreaterThanOrEqualToAnchor_constant_(box.leadingAnchor(), 6),
+        ])
+        box.heightAnchor().constraintEqualToConstant_(h).setActive_(True)
+        if w: box.widthAnchor().constraintEqualToConstant_(w).setActive_(True)
+        return box
+
+    @objc.python_method
+    def _arow(self, left, right, minh=36.0):
+        """Рядок картки: left пришпилений ЛІВОРУЧ, right ПРАВОРУЧ — явні констрейнти
+        (детерміновано; вкладені NSStackView-gravity «гуляли» → криві контроли)."""
+        if isinstance(left, str): left = self._albl(left)
+        row = self._al(NSView.alloc().init())
+        row.addSubview_(left); row.addSubview_(right)
+        H = NSUserInterfaceLayoutOrientationHorizontal
+        left.setContentHuggingPriority_forOrientation_(250, H)
+        left.setContentCompressionResistancePriority_forOrientation_(490, H)
+        right.setContentHuggingPriority_forOrientation_(751, H)
+        right.setContentCompressionResistancePriority_forOrientation_(751, H)
+        NSLayoutConstraint.activateConstraints_([
+            left.leadingAnchor().constraintEqualToAnchor_(row.leadingAnchor()),
+            left.centerYAnchor().constraintEqualToAnchor_(row.centerYAnchor()),
+            left.topAnchor().constraintGreaterThanOrEqualToAnchor_(row.topAnchor()),
+            left.bottomAnchor().constraintLessThanOrEqualToAnchor_(row.bottomAnchor()),
+            right.trailingAnchor().constraintEqualToAnchor_(row.trailingAnchor()),
+            right.centerYAnchor().constraintEqualToAnchor_(row.centerYAnchor()),
+            right.topAnchor().constraintGreaterThanOrEqualToAnchor_(row.topAnchor()),
+            right.bottomAnchor().constraintLessThanOrEqualToAnchor_(row.bottomAnchor()),
+            right.leadingAnchor().constraintGreaterThanOrEqualToAnchor_constant_(left.trailingAnchor(), 8),
+            row.heightAnchor().constraintGreaterThanOrEqualToConstant_(minh)])
+        return row
+
+    @objc.python_method
+    def _titled(self, lbl, sub=None):
+        """Ліва частина рядка: назва + (опц.) сірий підпис під нею."""
+        if sub is None: return self._albl(lbl)
+        v = self._vstack(1)
+        v.addArrangedSubview_(self._albl(lbl))
+        s = self._albl(sub, gray=True, size=11.0); v.addArrangedSubview_(s)
+        return v
+
+    @objc.python_method
+    def _is_dark(self):
+        try:
+            ap = self._glass.effectiveAppearance() if getattr(self, "_glass", None) else NSApp.effectiveAppearance()
+            return "Dark" in str(ap.name())
+        except Exception:
+            return True
+
+    @objc.python_method
+    def _card_tint(self):
+        # ПІДНЯТА напівпрозора поверхня: читається як картка АЛЕ пропускає скло.
+        # dark — світлий лифт; light — майже-білий фрост.
+        if self._is_dark():
+            return NSColor.colorWithRed_green_blue_alpha_(1, 1, 1, 0.055)
+        return NSColor.colorWithRed_green_blue_alpha_(1, 1, 1, 0.6)
+
+    @objc.python_method
+    def _card(self, rows, sep=True, gap=0):
+        box = self._al(NSBox.alloc().init())
+        box.setBoxType_(4); box.setTitlePosition_(0); box.setCornerRadius_(11.0)
+        box.setBorderWidth_(1.0); box.setBorderColor_(NSColor.separatorColor())
+        box.setFillColor_(self._card_tint())
+        self._cards.append(box)
+        box.setContentViewMargins_(NSMakeSize(0, 0))
+        inner = self._vstack(gap)               # gap>0 → відступ між блоками (без ліній-роздільників)
+        for i, r in enumerate(rows):
+            if i > 0 and sep:                      # sep=False → стек без ліній (як у HTML-мокапі)
+                ln = self._al(NSBox.alloc().init()); ln.setBoxType_(2)
+                inner.addArrangedSubview_(ln)
+                ln.heightAnchor().constraintEqualToConstant_(1).setActive_(True)
+                self._fillx(ln, inner)             # роздільник на всю ширину картки
+            inner.addArrangedSubview_(r)
+            self._fillx(r, inner, inset=14)        # рядки — з бічним полем 14
+        box.setContentView_(inner)
+        self._fillx(inner, box)
+        inner.topAnchor().constraintEqualToAnchor_constant_(box.topAnchor(), 5).setActive_(True)
+        inner.bottomAnchor().constraintEqualToAnchor_constant_(box.bottomAnchor(), -5).setActive_(True)
+        return box
+
+    @objc.python_method
+    def _section(self, title, rows, red=False):
+        v = self._vstack(7)
+        hdr = self._albl(title, size=12.0)
+        # насичений напівжирний заголовок — читається на склі без тіні
+        hdr.setFont_(NSFont.systemFontOfSize_weight_(12.0, 0.30))   # medium
+        if red:
+            hdr.setTextColor_(NSColor.systemRedColor())
+        else:
+            hdr.setTextColor_(NSColor.secondaryLabelColor())
+        v.addArrangedSubview_(hdr)
+        card = self._card(rows); v.addArrangedSubview_(card); self._fillx(card, v)
+        return v
+
+    @objc.python_method
+    def _hint(self, text):
+        f = self._albl(text, gray=True, size=11.0)
+        f.setUsesSingleLineMode_(False)
+        try:
+            f.cell().setWraps_(True); f.cell().setLineBreakMode_(0)   # 0=word-wrap
+        except Exception: pass
+        f.setContentHuggingPriority_forOrientation_(250, NSUserInterfaceLayoutOrientationVertical)
+        self._shadowed(f)   # читабельність на склі
+        # КРИТИЧНО: довгий хінт НЕ мусить розпирати ширину/блокувати ресайз вікна —
+        # хай переноситься. Низька compression-resistance по горизонталі = поступається.
+        f.setContentCompressionResistancePriority_forOrientation_(
+            200, NSUserInterfaceLayoutOrientationHorizontal)
+        f.setContentHuggingPriority_forOrientation_(
+            200, NSUserInterfaceLayoutOrientationHorizontal)
+        return f
+
+    @objc.python_method
+    def _aswitch(self, on, action):
+        s = self._al(NSSwitch.alloc().init())
+        s.setState_(1 if on else 0); s.setTarget_(self); s.setAction_(action)
+        return s
+
+    @objc.python_method
+    def _apopup(self, items, sel_title, action):
+        p = self._al(NSPopUpButton.alloc().initWithFrame_pullsDown_(NSMakeRect(0, 0, 10, 24), False))
+        p.addItemsWithTitles_(items)
+        if sel_title and sel_title in items: p.selectItemWithTitle_(sel_title)
+        p.setTarget_(self); p.setAction_(action)
+        p.widthAnchor().constraintGreaterThanOrEqualToConstant_(160).setActive_(True)
+        return p
+
+    @objc.python_method
+    def _abtn(self, title, action, danger=False, prim=False, symbol=None, tip=None):
+        cls = _DangerButton if danger else NSButton
+        b = self._al(cls.alloc().init())
+        b.setTitle_(title); b.setBezelStyle_(1)
+        b.setTarget_(self); b.setAction_(action)
+        if symbol:
+            try:
+                img = NSImage.imageWithSystemSymbolName_accessibilityDescription_(symbol, tip or title)
+                if img is not None:
+                    b.setImage_(img)
+                    b.setImagePosition_(1 if not title else 2)  # 1=ImageOnly 2=ImageLeft
+            except Exception: pass
+        if tip: b.setToolTip_(tip)
+        if prim:
+            try: b.setBezelColor_(accent_color())
+            except Exception: pass
+        if danger:
+            b._danger_title = title; b._paint(False)
+        return b
+
     @objc.python_method
     def _build(self):
-        W = 700
-        # Висота вікна = рівно стільки, щоб найвища вкладка («Загальні», nat 838 + шапка/відступи
-        # ≈ 106 = 944) вмістилася БЕЗ скролу — але не вище за робочу область екрана (13"/малі
-        # роздільності). Якщо екран нижчий → ріжемо до екрана, тоді вмикається внутр. скрол вкладки.
-        NEED_H = 960
+        W = 660
         try: screenH = NSScreen.mainScreen().visibleFrame().size.height
         except Exception: screenH = 900
-        H = int(max(760, min(NEED_H, screenH - 40)))
+        H = int(max(520, min(680, screenH - 80)))
         self.win = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
             NSMakeRect(0, 0, W, H),
             NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable
-            | NSWindowStyleMaskFullSizeContentView, NSBackingStoreBuffered, False)
-        # Мін-розмір малий: кожна вкладка має власний скрол-фолбек (nat), тож на 13"/
-        # коротких екранах контент не губиться — добирається скролом, а не розпиранням
-        # вікна. Жодних штучних мін-висот «щоб не злипалось».
-        self.win.setMinSize_((680, 460))
-        self.win.setMaxSize_((1000, 100000))
-        # без повноекранного режиму: зелена кнопка = zoom (максимізація), не fullscreen
-        self.win.setCollectionBehavior_(1 << 9)    # NSWindowCollectionBehaviorFullScreenNone
-        # напівпрозорість справжня: opaque-вікно ігнорувало слайдер прозорості.
-        self.win.setOpaque_(False)
-        self.win.setBackgroundColor_(NSColor.clearColor())
+            | NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskFullSizeContentView,
+            NSBackingStoreBuffered, False)
+        self.win.setMinSize_((560, 460))
+        self.win.setMaxSize_((100000, 100000))     # без штучного обмеження ширини
+        self.win.setCollectionBehavior_(1 << 9)    # FullScreenNone
         self.win.setTitle_("KobzarAI — Налаштування")
         self.win.setTitleVisibility_(1)            # NSWindowTitleHidden
         self.win.setTitlebarAppearsTransparent_(True)
-        self.win.setMovableByWindowBackground_(True)
+        self.win.setOpaque_(False)
+        self.win.setBackgroundColor_(NSColor.clearColor())
         self.win.setDelegate_(self)
         self.win.setReleasedWhenClosed_(False)
         self.win.center()
-        # Popover = напівпрозорий матеріал (десктоп просвічує). Слайдер «Прозорість»
-        # керує fill-overlay від solid (transp=0, читабельно як System Settings) до
-        # frost (transp=100, скло). WindowBackground був майже непрозорий → слайдер
-        # відкривав ПІД собою цей непрозорий матеріал, а не десктоп → ефекту не було.
-        glass = make_glass(NSMakeRect(0, 0, W, H), NSVisualEffectMaterialPopover)
+        # скляна підкладка — СПРАВЖНЄ Liquid Glass (NSGlassEffectView): десктоп
+        # заломлюється по контуру (лінза), текст чіткий. transp-слайдер керує
+        # fill-overlay (0=твердо як System Settings, 100=повне скло).
+        if _HAS_GLASS:
+            glass = NSGlassEffectView.alloc().initWithFrame_(NSMakeRect(0, 0, W, H))
+            try: glass.setStyle_(_GLASS_REGULAR)     # матове скло з обережним блюром
+            except Exception: pass
+            # contentLensing вимкнено: безперервне заломлення рухомого десктопу = головний
+            # GPU-кошт (WindowServer роздувався при відкритому вікні на 8 ГБ). Блюр+прозорість
+            # лишаються; зникає лише переливання по краю. Вмикається назад при потребі.
+            try: glass.set_contentLensing_(False)
+            except Exception: pass
+            glass.setAutoresizingMask_(18)
+            host = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, W, H))
+            host.setAutoresizingMask_(18)
+            glass.setContentView_(host)
+            self.win.setContentView_(glass)
+            self._glass = glass; self._host = host
+        else:
+            glass = make_glass(NSMakeRect(0, 0, W, H), NSVisualEffectMaterialUnderWindowBackground)
+            glass.setAutoresizingMask_(18)
+            self.win.setContentView_(glass)
+            self._glass = glass; self._host = glass
         self._apply_transp(glass)
-        self.win.setContentView_(glass)
-        self._glass = glass
-        # ── шапка: власний сегмент-перемикач у чистій верхній смузі (тайтл схований,
-        #    тож більше нічого з ним не колізить). NSTabView тінтиться лише системним
-        #    акцентом → ховаємо рідні вкладки, керуємо сегментом, який фарбуємо акцентом. ──
-        # nat = натуральна висота контенту вкладки. Фіксовані вкладки пришпилюються
-        # до ВЕРХУ (порожнеча — завжди знизу, узгоджено). chat=None → тягнеться на всю площу.
-        # nat = натуральна висота вкладки. «Моделі» теж фіксована (820): на великому екрані
-        # видно повністю без скролу, на малому — добирає скролом (бібліотека+папка не злипаються).
-        TABS = (("general", "Загальні", self._build_general, 838),
-                ("voice",   "Голос",    self._build_voice,   548),
-                ("models",  "Моделі",   self._build_models,  820),
-                ("chat",    "Міні-чат", self._build_chat,    None))
-        SEGH = 30
-        HEADER = 50                       # верхня смуга під сегмент
-        seg = NSSegmentedControl.alloc().initWithFrame_(
-            NSMakeRect((W - 460) / 2.0, H - HEADER + (HEADER - SEGH) / 2.0, 460, SEGH))
-        seg.setSegmentStyle_(1)            # Rounded — підтримує selectedSegmentBezelColor
-        seg.setSegmentCount_(len(TABS))
-        for i, (_id, title, _b, _h) in enumerate(TABS):
-            seg.setLabel_forSegment_(title, i)
-            seg.setWidth_forSegment_(115, i)
-        seg.setSelectedSegment_(0)
-        seg.setTarget_(self); seg.setAction_("segChanged:")
-        seg.setAutoresizingMask_(1 | 4 | 8)   # центр по X, пін до верху
-        try: seg.setSelectedSegmentBezelColor_(accent_color())
+        host = self._host
+        # — сегмент-навігація в UNIFIED-тулбарі —
+        # macOS САМ центрує світлофор по висоті тулбара (як System Settings), тож
+        # світлофор і сегмент стають на одну лінію без ручного зсуву кнопок (той ламався:
+        # кнопки живуть у 32px-тайтлбарі, нижче не влазять). Бонус: сегмент «плаває
+        # скляний» над контентом, що скролиться під ним (узгоджено з fade зверху).
+        seg = SlidingSegment.alloc().initWithLabels_frame_(
+            ["Загальні", "Голос", "Моделі", "Чат"], NSMakeRect(0, 0, 380, 30))
+        self._al(seg)
+        seg.setSelectedSegment_(0); seg.setTarget_action_(self, "tabChanged:")
+        # trackless: власну track-плашку НЕ малюємо — її роль грає скляна капсула
+        # unified-тулбара (macOS малює сам під центрованим item). Інакше дві плашки
+        # накладались концентрично (track сегмента + капсула тулбара).
+        seg.setTrackless_(True)
+        seg.widthAnchor().constraintEqualToConstant_(380).setActive_(True)
+        seg.heightAnchor().constraintEqualToConstant_(30).setActive_(True)
+        self.seg = seg
+        tb = NSToolbar.alloc().initWithIdentifier_("kobzar.settings.nav")
+        tb.setDelegate_(self)
+        tb.setAllowsUserCustomization_(False)
+        try: tb.setCenteredItemIdentifiers_({"nav"})        # macOS 13+
+        except Exception:
+            try: tb.setCenteredItemIdentifier_("nav")        # 11–12
+            except Exception: pass
+        self.win.setToolbar_(tb)
+        try: self.win.setToolbarStyle_(NSWindowToolbarStyleUnified)
         except Exception: pass
-        glass.addSubview_(seg); self.seg = seg
-        # tabview без рідних вкладок — лише контейнер контенту
-        tabsH = H - HEADER - 16
-        tabs = NSTabView.alloc().initWithFrame_(NSMakeRect(16, 16, W - 32, tabsH))
-        tabs.setTabViewType_(6)            # NSNoTabsNoBorder
-        tabs.setAutoresizingMask_(18)
-        glass.addSubview_(tabs)
-        self.tabs = tabs
-        CW, CH = W - 32 - 24, tabsH - 40    # видимий внутрішній розмір вкладки
-        for ident, title, builder, nat in TABS:
-            it = NSTabViewItem.alloc().initWithIdentifier_(ident)
-            it.setLabel_(title)
-            holder = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, CW, CH))
-            holder.setAutoresizingMask_(18)            # тягнеться з вкладкою
-            if nat:
-                # Фіксована вкладка ЗАВЖДИ у скролі (гарантія: інфо не губиться ніколи).
-                # Flipped-clipview → контент пришпилений до ВЕРХУ, старт згори, скролбар
-                # з'являється ЛИШЕ коли вкладка (nat) вища за видиму область (CH) —
-                # на великому екрані скролу не видно, на 13"/малому добирає різницю.
-                sv = NSScrollView.alloc().initWithFrame_(NSMakeRect(0, 0, CW, CH))
-                sv.setHasVerticalScroller_(True)
-                sv.setHasHorizontalScroller_(False)
-                sv.setAutohidesScrollers_(True)   # скролбар лише коли реально не влазить
-                sv.setDrawsBackground_(False)
-                sv.setAutoresizingMask_(18)
-                clip = _TopClipView.alloc().initWithFrame_(NSMakeRect(0, 0, CW, CH))
-                clip.setDrawsBackground_(False)
-                sv.setContentView_(clip)
-                doc = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, CW, nat))
-                doc.setAutoresizingMask_(2)        # тягнеться по ширині
-                builder(doc, CW, nat)
-                sv.setDocumentView_(doc)
-                holder.addSubview_(sv)
-            else:                                       # chat — на всю площу
-                builder(holder, CW, CH)
-            it.setView_(holder)
-            tabs.addTabViewItem_(it)
+        # — скрол на ВСЮ висоту host; контент заходить ПІД тулбар, fade згори —
+        scroll = self._al(_FadeScrollView.alloc().init())
+        clip = _TopClipView.alloc().init()      # перевернутий clip → контент пришпилений до ВЕРХУ
+        clip.setDrawsBackground_(False)         # прозорий → скло видно крізь скрол
+        scroll.setContentView_(clip)
+        scroll.setDrawsBackground_(False); scroll.setHasVerticalScroller_(True)
+        scroll.setAutohidesScrollers_(True)
+        host.addSubview_(scroll); self._scroll = scroll
+        NSLayoutConstraint.activateConstraints_([
+            scroll.topAnchor().constraintEqualToAnchor_(host.topAnchor()),
+            scroll.leadingAnchor().constraintEqualToAnchor_(host.leadingAnchor()),
+            scroll.trailingAnchor().constraintEqualToAnchor_(host.trailingAnchor()),
+            scroll.bottomAnchor().constraintEqualToAnchor_(host.bottomAnchor())])
+        self._pages = {}
+        self.tabs = None
+        self.select_tab(0)
+        try:    # тест-хук (прибрати перед релізом): відкрити одразу на вкладці N
+            _t = int(os.environ.get("KOBZARAI_TAB", "0"))
+            if _t: self.seg.setSelectedSegment_(_t); self.select_tab(_t)
+        except Exception: pass
+        # верхній відступ контенту = висота тулбара (контент стартує ПІД ним, скролиться під низ)
+        AppHelper.callAfter(self._sync_top_inset)
+
+    # ── unified-тулбар: делегат + синхронізація верхнього відступу контенту ──
+    def toolbarDefaultItemIdentifiers_(self, tb): return ["nav"]
+    def toolbarAllowedItemIdentifiers_(self, tb): return ["nav"]
+
+    def toolbar_itemForItemIdentifier_willBeInsertedIntoToolbar_(self, tb, ident, flag):
+        if str(ident) != "nav":
+            return None
+        it = NSToolbarItem.alloc().initWithItemIdentifier_("nav")
+        it.setView_(self.seg)
+        it.setMinSize_(NSMakeSize(380, 30)); it.setMaxSize_(NSMakeSize(380, 30))
+        return it
+
+    @objc.python_method
+    def _sync_top_inset(self):
+        """Верхній відступ скролу = висота тулбара: контент починається під сегментом,
+        але вільно заходить під нього при скролі (де його перехоплює fade)."""
+        sc = getattr(self, "_scroll", None)
+        if sc is None or self.win is None:
+            return
         try:
-            self.select_tab(min(int(os.environ.get("KOBZARAI_TAB", "0")), len(TABS) - 1))
-        except Exception: pass
+            wh = self.win.contentView().frame().size.height
+            top = max(0.0, wh - self.win.contentLayoutRect().size.height)
+        except Exception:
+            top = 52.0
+        if top <= 0:
+            top = 52.0
+        try:
+            sc.setAutomaticallyAdjustsContentInsets_(False)
+            sc.setContentInsets_((top, 0.0, 0.0, 0.0))      # NSEdgeInsets (top,left,bottom,right)
+            sc.setScrollerInsets_((top, 0.0, 0.0, 0.0))
+            sc._layout_mask()
+        except Exception:
+            pass
 
-    # ---------- вкладка: ГОЛОС (лише озвучення) ----------
     @objc.python_method
-    def _build_voice(self, v, CW, CH):
-        x0 = LP_M
-        cw = CW - 2 * LP_M
-        cx = x0 + LP_PAD + LP_LBL + 12
-        cwid = x0 + cw - LP_PAD - cx
-        y = CH - 14
+    def _page(self, children):
+        v = self._vstack(18)
+        for c in children:
+            v.addArrangedSubview_(c); self._fillx(c, v)
+        return v
 
-        # значення праворуч у ДВІ колонки: число (право-вирівняне) + одиниця (ліво-вирівняна).
-        # Так цифри 1.20/0.00 стоять у спільну колонку незалежно від довжини суфікса (×, c).
-        numw = 38          # колонка цифр
-        unitw = 16         # колонка одиниці
-        valw = numw + 3 + unitw
-        gap = 14
-        slw = lambda: cwid - valw - gap
-        VMONO = NSFont.monospacedSystemFontOfSize_weight_(12.0, 0.0)
-
-        def stepped(yrow, lbl, lo, hi, ticks, cur, action, unit):
-            self._lbl(v, lbl, x0 + LP_PAD, self._cy(top, yrow, 18), LP_LBL, align=1)
-            sl = _AccentSlider.alloc().initWithFrame_(
-                NSMakeRect(cx, self._cy(top, yrow, 22), slw(), 22))
-            sl.setMinValue_(lo); sl.setMaxValue_(hi)
-            sl.setNumberOfTickMarks_(ticks)            # дискретні поділки
-            sl.setAllowsTickMarkValuesOnly_(True)      # тягнеться кроками, не плавно
-            sl.setFloatValue_(cur)
-            sl.setContinuous_(True)
-            sl.setTarget_(self); sl.setAction_(action); sl.setAutoresizingMask_(2)
-            v.addSubview_(sl)
-            yv = self._cy(top, yrow, 18)
-            numx = cx + cwid - valw
-            num = self._lbl(v, f"{cur:.2f}", numx, yv, numw, h=18, mask=1, align=1)
-            num.setFont_(VMONO)
-            u = self._lbl(v, unit, numx + numw + 3, yv, unitw, h=18, mask=1, align=0)
-            u.setFont_(VMONO); u.setTextColor_(NSColor.secondaryLabelColor())
-            return sl, num
-
-        # ── ОЗВУЧЕННЯ ──
-        top = self._grp(v, "ОЗВУЧЕННЯ", x0, y, cw)
-        self._card(v, x0, top, cw, 3)
-        # рядок 0 — голос
-        self._lbl(v, "Голос", x0 + LP_PAD, self._cy(top, 0, 18), LP_LBL, align=1)
-        pop = NSPopUpButton.alloc().initWithFrame_pullsDown_(
-            NSMakeRect(cx, self._cy(top, 0, 26), cwid, 26), False)
-        pop.addItemsWithTitles_(VOICES)
-        if self.panel.voice in VOICES:
-            pop.selectItemWithTitle_(self.panel.voice)
-        pop.setTarget_(self); pop.setAction_("voiceChanged:"); pop.setAutoresizingMask_(10)
-        pop.setFocusRingType_(1)
-        v.addSubview_(pop)
-        # рядок 1 — швидкість 0.70–1.30 кроком 0.05 (13 поділок)
-        self.speed_sl, self.speed_val = stepped(
-            1, "Швидкість", 0.7, 1.3, 13, getattr(self.panel, "speed", 1.0),
-            "speedChanged:", "×")
-        # рядок 2 — пауза між реченнями 0.00–0.50 c кроком 0.05 (11 поділок)
-        self.pause_sl, self.pause_val = stepped(
-            2, "Пауза реч.", 0.0, 0.5, 11, getattr(self.panel, "pause", 0.15),
-            "pauseChanged:", "c")
-        # прев'ю-кнопка під карткою
-        y = top - (2 * LP_PAD + 3 * LP_ROW)
-        btn_y = y - 30
-        btn_h = 24
-        pv = NSButton.alloc().initWithFrame_(
-            NSMakeRect(x0 + LP_PAD, btn_y, 170, btn_h))
-        pv.setBezelStyle_(1); pv.setTitle_("Прослухати зразок")
-        try: pv.setBezelColor_(accent_color())     # активна-акцентна, щоб помітно
-        except Exception: pass
-        pv.setTarget_(self); pv.setAction_("previewVoice:"); pv.setAutoresizingMask_(8)
-        v.addSubview_(pv); self.preview_btn = pv
-        # підпис — по центру кнопки по вертикалі (h=16, центр = центр кнопки)
-        hint = self._lbl(v, "Тест голосу · швидкості · паузи.",
-                         x0 + LP_PAD + 170 + 14, btn_y + (btn_h - 16) / 2.0,
-                         cw - LP_PAD - 170 - 14, gray=True, h=16)
-        hint.setFont_(NSFont.systemFontOfSize_(12.0))
-
-        # ── РЕЖИМ ОЗВУЧЕННЯ ── Базовий / Швидкий / Наживо (стабільний дефолт = Базовий)
-        y = btn_y - LP_SEC - 6
-        top = self._grp(v, "РЕЖИМ ОЗВУЧЕННЯ", x0, y, cw)
-        self._card(v, x0, top, cw, 1)
-        self._lbl(v, "Режим", x0 + LP_PAD, self._cy(top, 0, 18), LP_LBL, align=1)
-        ms = NSSegmentedControl.alloc().initWithFrame_(
-            NSMakeRect(cx, self._cy(top, 0, 26), 300, 26))
-        ms.setSegmentCount_(3); ms.setSegmentStyle_(1)
-        ms.setLabel_forSegment_("Базовий", 0)
-        ms.setLabel_forSegment_("Швидкий", 1)
-        ms.setLabel_forSegment_("Наживо", 2)
-        ms.setWidth_forSegment_(90, 0); ms.setWidth_forSegment_(90, 1); ms.setWidth_forSegment_(110, 2)
-        ms.setSelectedSegment_({"base": 0, "stream": 1, "realtime": 2}.get(tts_mode(), 0))
-        try: ms.setSelectedSegmentBezelColor_(accent_color())
-        except Exception: pass
-        ms.setTarget_(self); ms.setAction_("ttsModeChanged:"); ms.setAutoresizingMask_(8)
-        v.addSubview_(ms); self.tts_mode = ms
-        cb = top - (2 * LP_PAD + 1 * LP_ROW)           # низ картки
-        n = self._lbl(v, "Базовий — цілим файлом, найрівніший тембр, але повільніший старт. "
-                         "Швидкий — миттєвий старт, без швів на довгому тексті (для виділеного/буфера). "
-                         "Наживо — чат озвучує поки модель пише; тембр стрибає між реченнями (норма). "
-                         "«Наживо» діє лише у вбудованому чаті.",
-                      x0 + LP_PAD, cb - 46, cw - 2 * LP_PAD, gray=True, h=44)
-        n.setFont_(NSFont.systemFontOfSize_(11.0))
-        try: n.cell().setWraps_(True)
-        except Exception: pass
-
-        # ── ОПТИМІЗАЦІЯ RAM (8 ГБ) ── авто-вивантаження TTS з RAM по простою
-        y = (cb - 46) - LP_SEC - 10
-        top = self._grp(v, "ОПТИМІЗАЦІЯ RAM (8 ГБ)", x0, y, cw)
-        self._card(v, x0, top, cw, 1)
-        self._lbl(v, "Вивантажити TTS", x0 + LP_PAD, self._cy(top, 0, 18), LP_LBL, align=1)
-        ip = NSPopUpButton.alloc().initWithFrame_pullsDown_(
-            NSMakeRect(cx, self._cy(top, 0, 26), 200, 26), False)
-        ip.addItemsWithTitles_(TTS_IDLE_LABELS)
-        ip.selectItemAtIndex_(tts_idle_index())
-        ip.setTarget_(self); ip.setAction_("ttsIdleChanged:"); ip.setAutoresizingMask_(8)
-        ip.setFocusRingType_(1)
-        v.addSubview_(ip); self.tts_idle = ip
-        cb2 = top - (2 * LP_PAD + 1 * LP_ROW)
-        n2 = self._lbl(v, "Голос (StyleTTS2) тримає ~2 ГБ у RAM, поки модель завантажена. "
-                          "Після N хв без озвучки сервер вивантажиться й RAM звільниться; "
-                          "наступний голос підніме його холодно (~20 c), далі знову миттєво. "
-                          "Корисно на 8 ГБ. «Ніколи» — тримати завжди (швидше, але −2 ГБ).",
-                       x0 + LP_PAD, cb2 - 46, cw - 2 * LP_PAD, gray=True, h=44)
-        n2.setFont_(NSFont.systemFontOfSize_(11.0))
-        try: n2.cell().setWraps_(True)
-        except Exception: pass
-
-    # ---------- вкладка: ЗАГАЛЬНІ (вигляд · хоткеї · автозапуск · генерація) ----------
     @objc.python_method
-    def _build_general(self, v, CW, CH):
-        x0 = LP_M
-        cw = CW - 2 * LP_M
-        cx = x0 + LP_PAD + LP_LBL + 12
-        y = CH - 14
+    def _group(self, section, hint=None):
+        """Секція + (опц.) хінт, приклеєний під картку малим проміжком."""
+        if hint is None: return section
+        v = self._vstack(5)
+        v.addArrangedSubview_(section); self._fillx(section, v)
+        h = self._hint(hint); v.addArrangedSubview_(h); self._fillx(h, v)
+        return v
 
-        # ── ВИГЛЯД ── (акцент НЕ налаштовуємо — береться системний macOS)
-        top = self._grp(v, "ВИГЛЯД", x0, y, cw)
-        self._card(v, x0, top, cw, 2)
-        self._lbl(v, "Тема", x0 + LP_PAD, self._cy(top, 0, 18), LP_LBL, align=1)
-        tp = NSPopUpButton.alloc().initWithFrame_pullsDown_(
-            NSMakeRect(cx, self._cy(top, 0, 26), 220, 26), False)
-        tp.addItemsWithTitles_(THEMES)
-        tp.selectItemWithTitle_(load_cfg().get("theme", "Авто"))
-        tp.setTarget_(self); tp.setAction_("themeChanged:"); tp.setAutoresizingMask_(8)
-        tp.setFocusRingType_(1)
-        v.addSubview_(tp)
-        self._lbl(v, "Прозорість", x0 + LP_PAD, self._cy(top, 1, 18), LP_LBL, align=1)
-        sl = _AccentSlider.alloc().initWithFrame_(NSMakeRect(cx, self._cy(top, 1, 22), 220, 22))
-        sl.setMinValue_(0.0); sl.setMaxValue_(100.0)
-        sl.setFloatValue_(float(load_cfg().get("transp", 35)))
-        sl.setContinuous_(True)
-        sl.setTarget_(self); sl.setAction_("transpChanged:"); sl.setAutoresizingMask_(8)
-        v.addSubview_(sl); self.transp = sl
-        # підказка під карткою: де міняти акцент
-        self._lbl(v, "Акцентний колір — Системні параметри → Вигляд.",
-                  x0 + LP_PAD, top - (2 * LP_PAD + 2 * LP_ROW) - 1, cw - 2 * LP_PAD,
-                  gray=True, h=14).setFont_(NSFont.systemFontOfSize_(11.0))
-        y = top - (2 * LP_PAD + 2 * LP_ROW) - LP_SEC - 14
-
-        # ── ГЛОБАЛЬНІ ХОТКЕЇ ──
-        top = self._grp(v, "ГЛОБАЛЬНІ ХОТКЕЇ", x0, y, cw)
-        self._card(v, x0, top, cw, len(HK_LABELS))
-        for i, (act, label) in enumerate(HK_LABELS):
-            self._lbl(v, label, x0 + LP_PAD, self._cy(top, i, 18), LP_LBL, align=1)
-            cur = self._lbl(v, "", cx, self._cy(top, i, 18), 120)
-            cur.setFont_(NSFont.monospacedSystemFontOfSize_weight_(12.5, 0.0))
-            self.hk_btns[act] = cur
-            xclr = x0 + cw - LP_PAD - 28
-            xrec = xclr - 8 - 96
-            self._btn(v, "Записати", xrec, self._cy(top, i, 26), 96, "recordHK:", h=26, mask=8).setTag_(i)
-            self._ibtn(v, "xmark", xclr, self._cy(top, i, 26), "clearHK:", w=28,
-                       tip="Очистити", color=NSColor.secondaryLabelColor()).setTag_(i)
-        y = top - (2 * LP_PAD + len(HK_LABELS) * LP_ROW)
-        self._lbl(v, "«Записати» → натисни комбо. Esc — скасувати.",
-                  x0 + LP_PAD, y - 15, cw - 2 * LP_PAD, gray=True, h=14)
-        y -= 15 + LP_SEC
-
-        # ── АВТОЗАПУСК ──
-        top = self._grp(v, "АВТОЗАПУСК", x0, y, cw)
-        self._card(v, x0, top, cw, 3)
+    @objc.python_method
+    def _page_general(self, *_):
         cfg = load_cfg()
-        self.auto_login = NSButton.alloc().initWithFrame_(
-            NSMakeRect(x0 + LP_PAD, self._cy(top, 0, 22), cw - 2 * LP_PAD, 22))
-        self.auto_login.setButtonType_(3)
-        self.auto_login.setTitle_("Запускати KobzarAI разом із входом у систему")
-        self.auto_login.setState_(1 if cfg.get("autostart_login") else 0)
-        self.auto_login.setTarget_(self); self.auto_login.setAction_("autoLoginToggled:")
-        self.auto_login.setAutoresizingMask_(8); v.addSubview_(self.auto_login)
-        self._acc_check(self.auto_login)
-        self.auto_oll = NSButton.alloc().initWithFrame_(
-            NSMakeRect(x0 + LP_PAD, self._cy(top, 1, 22), cw - 2 * LP_PAD, 22))
-        self.auto_oll.setButtonType_(3); self.auto_oll.setTitle_("При відкритті панелі — запускати Ollama")
-        self.auto_oll.setState_(1 if cfg.get("autostart_ollama") else 0)
-        self.auto_oll.setTarget_(self); self.auto_oll.setAction_("autoOllToggled:")
-        self.auto_oll.setAutoresizingMask_(8); v.addSubview_(self.auto_oll)
-        self._acc_check(self.auto_oll)
-        self.auto_tts = NSButton.alloc().initWithFrame_(
-            NSMakeRect(x0 + LP_PAD, self._cy(top, 2, 22), cw - 2 * LP_PAD, 22))
-        self.auto_tts.setButtonType_(3); self.auto_tts.setTitle_("При відкритті панелі — запускати TTS (озвучка)")
-        self.auto_tts.setState_(1 if cfg.get("autostart_tts") else 0)
-        self.auto_tts.setTarget_(self); self.auto_tts.setAction_("autoTtsToggled:")
-        self.auto_tts.setAutoresizingMask_(8); v.addSubview_(self.auto_tts)
-        self._acc_check(self.auto_tts)
-        y = top - (2 * LP_PAD + 3 * LP_ROW) - LP_SEC
+        hk = cfg.get("hotkeys", DEFAULT_HOTKEYS)
+        # — Глобальні хоткеї —
+        rows = []
+        for idx, (act, title) in enumerate(HK_LABELS):
+            kbd = self._albl(fmt_hotkey(hk.get(act)) or "—")
+            kbd.setTextColor_(NSColor.labelColor())    # повний колір — клавіша читабельна
+            kbd.setFont_(NSFont.monospacedSystemFontOfSize_weight_(13.5, 0.30))
+            kbd.setAlignment_(2)                       # центр у капсулі
+            self.hk_btns[act] = kbd
+            cap = self._cap(kbd, w=128)                # фікс-ширина → столбець вирівняний
+            b = self._abtn("Записати", "recordHK:"); b.setTag_(idx)
+            rst = self._abtn("", "clearHK:", symbol="arrow.uturn.backward",
+                             tip="Скинути хоткей"); rst.setTag_(idx)
+            trio = self._hstack(8)
+            for w in (cap, b, rst): trio.addArrangedSubview_(w)
+            rows.append(self._arow(title, trio))
+        hk_sec = self._section("Глобальні хоткеї", rows)
+        # — Вигляд —
+        theme = self._apopup(THEMES, cfg.get("theme", "Авто"), "themeChanged:")
+        # той самий slider-рядок, що й у Голосі (Швидкість/Гучність) — однакова підкладка
+        trow, self.transp_sl, self.transp_val = self._aslider_row(
+            "Прозорість фону", 0, 100, int(cfg.get("transp", 20)), "transpChanged:",
+            lambda x: "%d%%" % int(x))
+        look = self._section("Вигляд", [self._arow("Тема", theme), trow])
+        # — Автозапуск —
+        self.auto_login = self._aswitch(cfg.get("autostart_login"), "autoLoginToggled:")
+        self.auto_oll = self._aswitch(cfg.get("autostart_ollama"), "autoOllToggled:")
+        self.auto_tts = self._aswitch(cfg.get("autostart_tts"), "autoTtsToggled:")
+        auto = self._section("Автозапуск", [
+            self._arow("Разом із входом у систему", self.auto_login),
+            self._arow("Ollama", self.auto_oll),
+            self._arow("Озвучення (TTS)", self.auto_tts)])
+        # — Оптимізація Ollama —
+        self.opt_flash = self._aswitch(cfg.get("ollama_flash", True), "optFlashToggled:")
+        self.opt_kv = self._aswitch(cfg.get("ollama_kv_q8", True), "optKvToggled:")
+        opt = self._section("Оптимізація Ollama (8 ГБ)", [
+            self._arow(self._titled("Flash Attention", "швидше, менше RAM на контекст"), self.opt_flash),
+            self._arow(self._titled("KV-кеш 8-біт", "~вдвічі менше памʼяті (потребує Flash)"), self.opt_kv)])
+        # — Чати —
+        self.chats_field = self._afield("")             # редаговане поле — як Папка моделей
+        self.chats_field.setStringValue_(chats_dir())
+        self.chats_field.setFont_(NSFont.monospacedSystemFontOfSize_weight_(11.5, 0.0))
+        chats_btns = self._hstack_pair(
+            self._abtn("", "browseChatsDir:", symbol="folder", tip="Огляд…"),
+            self._abtn("Застосувати", "applyChatsDir:"))
+        chats = self._section("Чати", [self._arow(self.chats_field, chats_btns)])
+        # — База знань (RAG) —
+        # Готові індекси: НЕ переembedимо мільйони токенів — читаємо вже пораховане
+        # (librarian та ін.) через sqlite-vec. Внизу — альтернатива: своя тека з нуля.
+        self._kb_index_paths = [""]                # 0 = «готового не використовувати»
+        opts = ["— готовий індекс не обрано —"]
+        try:
+            import kb as _kbmod
+            for it in _kbmod.discover_indexes():
+                top = sorted(it["sources"].items(), key=lambda kv: -kv[1])[:2]
+                lbl = os.path.basename(os.path.dirname(it["path"])) or os.path.basename(it["path"])
+                tail = (" · " + ", ".join(s for s, _ in top)) if top else ""
+                opts.append("%s · %d фрагм%s" % (lbl, it["chunks"], tail))
+                self._kb_index_paths.append(it["path"])
+        except Exception:
+            pass
+        self.kb_index_pop = self._apopup(opts, opts[0], "kbIndexChanged:")
+        if self.kb_index in self._kb_index_paths:
+            self.kb_index_pop.selectItemAtIndex_(self._kb_index_paths.index(self.kb_index))
+        self.kb_field = self._afield("або тека з нотатками (.md, .txt) для власного індексу…")
+        self.kb_field.setStringValue_(self.kb_folder)
+        self.kb_field.setFont_(NSFont.monospacedSystemFontOfSize_weight_(11.5, 0.0))
+        self.kb_status = self._albl(self._kb_status_text(), gray=True)
+        self.kb_browse_btn = self._abtn("", "browseKbDir:", symbol="folder", tip="Обрати теку…")
+        self.kb_index_btn = self._abtn("Проіндексувати", "reindexKb:")
+        kb_btns = self._hstack_pair(self.kb_browse_btn, self.kb_index_btn)
+        kb_sec = self._section("База знань", [
+            self._arow("Готовий індекс", self.kb_index_pop),
+            self._arow(self.kb_field, kb_btns),
+            self._arow("Стан", self.kb_status)])
+        self._kb_sync_controls()
+        # — Небезпечна зона —
+        danger = self._section("Небезпечна зона", [self._arow(
+            self._titled("Видалити KobzarAI",
+                         "зупинить сервіси й безповоротно зітре застосунок, лаунчер і TTS"),
+            self._abtn("Видалити…", "uninstallApp:", danger=True))], red=True)
+        return self._page([
+            self._group(hk_sec, "«Записати» → натисни комбо. Esc — скасувати."),
+            self._group(look),
+            self._group(auto, "Ollama та голос стартують самі при відкритті застосунку."),
+            self._group(opt, "Діє при наступному старті Ollama (СТОП → Старт у меню)."),
+            self._group(chats, "Кожен чат — окремий .json. Зміна теки стосується подальших."),
+            self._group(kb_sec, "Локальний семантичний пошук по обраній теці (Ollama bge-m3). "
+                                "Тумблер «книжки» у полі чату вмикає використання."),
+            self._group(danger, "Моделі на зовнішньому диску НЕ чіпаються.")])
 
-        # ── ГЕНЕРАЦІЯ ──
-        top = self._grp(v, "ГЕНЕРАЦІЯ", x0, y, cw)
-        self._card(v, x0, top, cw, 1)
-        self._lbl(v, "Відповідь, токенів", x0 + LP_PAD, self._cy(top, 0, 18), LP_LBL, align=1)
-        self.token_pop = NSPopUpButton.alloc().initWithFrame_pullsDown_(
-            NSMakeRect(cx, self._cy(top, 0, 26), 120, 26), False)
-        self.token_pop.addItemsWithTitles_(TOKEN_OPTS)
-        self.token_pop.selectItemWithTitle_(str(load_cfg().get("num_predict", 2048)))
-        self.token_pop.setTarget_(self); self.token_pop.setAction_("tokenChanged:")
-        self.token_pop.setFocusRingType_(1)
-        self.token_pop.setAutoresizingMask_(8); v.addSubview_(self.token_pop)
-        y = top - (2 * LP_PAD + 1 * LP_ROW) - LP_SEC
-
-        # ── ОПТИМІЗАЦІЯ OLLAMA (8ГБ) ──
-        top = self._grp(v, "ОПТИМІЗАЦІЯ OLLAMA (8ГБ)", x0, y, cw)
-        self._card(v, x0, top, cw, 2)
-        cfg = load_cfg()
-        self.opt_flash = NSButton.alloc().initWithFrame_(
-            NSMakeRect(x0 + LP_PAD, self._cy(top, 0, 22), cw - 2 * LP_PAD, 22))
-        self.opt_flash.setButtonType_(3)
-        self.opt_flash.setTitle_("Flash Attention — швидше, менше RAM на контекст")
-        self.opt_flash.setState_(1 if cfg.get("ollama_flash", True) else 0)
-        self.opt_flash.setTarget_(self); self.opt_flash.setAction_("optFlashToggled:")
-        self.opt_flash.setAutoresizingMask_(8); v.addSubview_(self.opt_flash)
-        self._acc_check(self.opt_flash)
-        self.opt_kv = NSButton.alloc().initWithFrame_(
-            NSMakeRect(x0 + LP_PAD, self._cy(top, 1, 22), cw - 2 * LP_PAD, 22))
-        self.opt_kv.setButtonType_(3)
-        self.opt_kv.setTitle_("KV-кеш 8-біт — ~вдвічі менше пам'яті (потребує Flash)")
-        self.opt_kv.setState_(1 if cfg.get("ollama_kv_q8", True) else 0)
-        self.opt_kv.setTarget_(self); self.opt_kv.setAction_("optKvToggled:")
-        self.opt_kv.setAutoresizingMask_(8); v.addSubview_(self.opt_kv)
-        self.opt_kv.setEnabled_(bool(cfg.get("ollama_flash", True)))   # KV без Flash не діє
-        self._acc_check(self.opt_kv)
-        y = top - (2 * LP_PAD + 2 * LP_ROW)
-        self._lbl(v, "Діє при наступному старті Ollama (СТОП → Старт у меню).",
-                  x0 + LP_PAD, y - 15, cw - 2 * LP_PAD, gray=True, h=14)
-
-    # ---------- вкладка 2: моделі ----------
     @objc.python_method
-    def _build_models(self, v, CW, CH):
-        x0 = LP_M
-        cw = CW - 2 * LP_M
-        il = x0 + LP_PAD                 # ліва межа контенту картки
-        ir = x0 + cw - LP_PAD            # права межа
-        iw = ir - il                     # ширина контенту
-        y = CH - 14
+    def _hstack_pair(self, a, b):
+        h = self._hstack(8); h.addArrangedSubview_(a); h.addArrangedSubview_(b)
+        return h
 
-        # ── АКТИВНА МОДЕЛЬ ──
-        top = self._grp(v, "АКТИВНА МОДЕЛЬ", x0, y, cw)
-        self._card(v, x0, top, cw, 3)
-        self.model_pop = NSPopUpButton.alloc().initWithFrame_pullsDown_(
-            NSMakeRect(il, self._cy(top, 0, 26), iw, 26), False)
-        self.model_pop.setTarget_(self); self.model_pop.setAction_("modelChanged:")
-        self.model_pop.setFocusRingType_(1)          # без синьої focus-обводки
-        self.model_pop.setAutoresizingMask_(10)
-        v.addSubview_(self.model_pop)
-        self.loaded_lbl = self._lbl(v, "", il, self._cy(top, 1, 18), iw, gray=True)
-        bw = (iw - 2 * LP_GAP) / 3.0
-        self.load_btn = self._btn(v, "У RAM", il, self._cy(top, 2, 26), bw, "loadModel:",
-                  h=26, symbol="arrow.down.circle")
-        self._btn(v, "Вивантажити", il + bw + LP_GAP, self._cy(top, 2, 26), bw, "unloadModel:",
-                  h=26, symbol="arrow.up.circle")
-        self._btn(v, "Видалити", il + 2 * (bw + LP_GAP), self._cy(top, 2, 26), bw, "deleteModel:",
-                  h=26, symbol="trash")
-        y = top - (2 * LP_PAD + 3 * LP_ROW) - LP_SEC
+    @objc.python_method
+    def _aslider_row(self, title, mn, mx, val, action, valfmt):
+        """Рядок: лейбл · нативний слайдер (розпирається) · значення праворуч.
+        Повертає (row, slider, value_label)."""
+        sl = self._al(NSSlider.alloc().init())
+        sl.setMinValue_(mn); sl.setMaxValue_(mx); sl.setFloatValue_(float(val))
+        sl.setContinuous_(True); sl.setTarget_(self); sl.setAction_(action)
+        sl.setContentHuggingPriority_forOrientation_(1, NSUserInterfaceLayoutOrientationHorizontal)
+        vlbl = self._albl(valfmt(val), gray=True)
+        vlbl.widthAnchor().constraintEqualToConstant_(56).setActive_(True)
+        tlbl = self._albl(title)
+        tlbl.widthAnchor().constraintGreaterThanOrEqualToConstant_(150).setActive_(True)
+        tlbl.setContentHuggingPriority_forOrientation_(250, NSUserInterfaceLayoutOrientationHorizontal)
+        row = self._hstack(10)
+        for w in (tlbl, sl, vlbl): row.addArrangedSubview_(w)
+        row.heightAnchor().constraintGreaterThanOrEqualToConstant_(36).setActive_(True)
+        return row, sl, vlbl
 
-        # ── ЗАВАНТАЖИТИ НОВУ ──
-        top = self._grp(v, "ЗАВАНТАЖИТИ НОВУ", x0, y, cw)
-        self._card(v, x0, top, cw, 3)
-        self.pull_field = self._field(v, il, self._cy(top, 0, 26), iw - 140,
-                                      "qwen3:4b-instruct-2507-q4_K_M", mask=10)
-        self.pull_btn = self._btn(v, "Завантажити", ir - 130, self._cy(top, 0, 26), 130, "doPull:",
-                  h=26, mask=9, symbol="square.and.arrow.down")
-        self._update_pull_btn()
-        # активне табло прогресу (визначений бар + %), показується лише під час тяги
-        self.pull_bar = NSProgressIndicator.alloc().initWithFrame_(
-            NSMakeRect(il, self._cy(top, 1, 8) + 4, iw, 8))
-        self.pull_bar.setStyle_(0)               # NSProgressIndicatorBarStyle
-        self.pull_bar.setIndeterminate_(False)
-        self.pull_bar.setMinValue_(0.0); self.pull_bar.setMaxValue_(100.0)
-        self.pull_bar.setHidden_(True); self.pull_bar.setAutoresizingMask_(10)
-        v.addSubview_(self.pull_bar)
-        self.pull_status = self._lbl(v, "ollama.com/library  ·  hf.co/<repo>:Q4_K_M",
-                                     il, self._cy(top, 2, 16), iw, gray=True, h=14)
-        # довгі назви не ламають верстку — обрізаємо посередині
-        try: self.pull_status.cell().setLineBreakMode_(5)   # TruncatingMiddle
+    @objc.python_method
+    def _page_voice(self, *_):
+        p = self.panel
+        # — Озвучення —
+        voice = self._apopup([voice_label(x) for x in VOICES],
+                             voice_label(getattr(p, "voice", VOICES[0])), "voiceChanged:")
+        srow, self.speed_sl, self.speed_val = self._aslider_row(
+            "Швидкість", 0.7, 1.3, getattr(p, "speed", 1.0), "speedChanged:",
+            lambda x: f"×{x:.2f}")
+        vrow, self.vol_sl, self.vol_val = self._aslider_row(
+            "Гучність", 0.0, 1.0, getattr(p, "volume", 0.85), "volumeChanged:",
+            lambda x: f"{int(round(x * 100))}%")
+        prow, self.pause_sl, self.pause_val = self._aslider_row(
+            "Пауза між реченнями", 0.0, 0.5, getattr(p, "pause", 0.15), "pauseChanged:",
+            lambda x: f"{x:.2f} с")
+        listen = self._abtn("Прослухати", "previewVoice:")
+        self.listen_btn = listen
+        listen.heightAnchor().constraintEqualToConstant_(30).setActive_(True)
+        voc = self._section("Озвучення", [
+            self._arow("Голос моделі", voice), srow, vrow, prow,
+            self._arow("Зразок голосу", listen)])
+        # — Режим озвучення (сегмент, що їде) —
+        mode = SlidingSegment.alloc().initWithLabels_frame_(
+            ["Базово", "Швидко", "Наживо"], NSMakeRect(0, 0, 280, 28))
+        self._al(mode)
+        mode.setSelectedSegment_({"base": 0, "stream": 1, "realtime": 2}.get(tts_mode(), 0))
+        mode.setTarget_action_(self, "ttsModeChanged:")
+        mode.widthAnchor().constraintEqualToConstant_(280).setActive_(True)
+        mode.heightAnchor().constraintEqualToConstant_(28).setActive_(True)
+        self.tts_mode = mode
+        mode_sec = self._section("Режим озвучення", [self._arow("Режим", mode)])
+        # — Оптимізація RAM —
+        idle = self._apopup(TTS_IDLE_LABELS, TTS_IDLE_LABELS[tts_idle_index()], "ttsIdleChanged:")
+        self.tts_idle = idle
+        ram_sec = self._section("Оптимізація RAM (8 ГБ)", [self._arow(
+            self._titled("Вивантажити TTS",
+                         "після N хв без озвучки звільнити ~2 ГБ; наступний голос — холодний старт ~20 c"),
+            idle)])
+        # — Вивід звуку —
+        op = self._al(NSPopUpButton.alloc().initWithFrame_pullsDown_(NSMakeRect(0, 0, 10, 24), False))
+        op.addItemWithTitle_("Системний за замовч.")
+        self._out_uids = [None]
+        cur = getattr(p, "out_device", None)
+        for nm, uid in audio_outputs():
+            op.addItemWithTitle_(nm); self._out_uids.append(uid)
+            if uid == cur: op.selectItemAtIndex_(len(self._out_uids) - 1)
+        op.setTarget_(self); op.setAction_("outDeviceChanged:")
+        op.widthAnchor().constraintGreaterThanOrEqualToConstant_(160).setActive_(True)
+        self.out_pop = op
+        out_sec = self._section("Вивід звуку", [self._arow("Пристрій виводу", op)])
+        return self._page([
+            voc,
+            # пояснення режимів приклеєне ПІД секцію «Режим озвучення» (повернуто)
+            self._group(mode_sec,
+                "Базово — цілим файлом (рівніший тембр).\n"
+                "Швидко — миттєвий старт.\n"
+                "Наживо — озвучує поки модель пише (лише у вбудованому чаті)."),
+            self._group(ram_sec,
+                "«Ніколи» — тримати голос у RAM завжди (швидше, але −2 ГБ)."),
+            self._group(out_sec,
+                "За замовч. — поточний вихід системи. Діє на нову озвучку.")])
+    @objc.python_method
+    def _afield(self, placeholder=""):
+        """Нативне однорядкове поле (констрейнти, без піксельних координат)."""
+        f = self._al(NSTextField.alloc().init())
+        f.setEditable_(True); f.setBezeled_(True); f.setBezelStyle_(0)
+        if placeholder: f.setPlaceholderString_(placeholder)
+        f.setFocusRingType_(1); f.setUsesSingleLineMode_(True)
+        try:
+            c = f.cell(); c.setScrollable_(True); c.setWraps_(False); c.setLineBreakMode_(5)
         except Exception: pass
-        y = top - (2 * LP_PAD + 3 * LP_ROW) - LP_SEC
+        f.setContentHuggingPriority_forOrientation_(250, NSUserInterfaceLayoutOrientationHorizontal)
+        f.heightAnchor().constraintEqualToConstant_(24).setActive_(True)
+        return f
 
-        # ── ПАПКА МОДЕЛЕЙ (пришпилена ДО НИЗУ — щоб бібліотека росла з висотою вікна) ──
-        fb = 6                                   # нижній відступ
-        fcard_h = 2 * LP_PAD + 2 * LP_ROW
-        fcard_top = fb + fcard_h
-        fgrp_top = fcard_top + LP_HDR
-        fl = self._lbl(v, "ПАПКА МОДЕЛЕЙ", x0 + 4, fgrp_top - 15, cw, gray=True, h=14, mask=34)
-        fl.setFont_(NSFont.systemFontOfSize_(11.0))
-        fbox = NSBox.alloc().initWithFrame_(NSMakeRect(x0, fb, cw, fcard_h))
-        fbox.setBoxType_(4); fbox.setTitlePosition_(0); fbox.setCornerRadius_(10.0)
-        fbox.setBorderWidth_(1.0); fbox.setBorderColor_(NSColor.separatorColor())
-        fbox.setFillColor_(NSColor.colorWithWhite_alpha_(0.5, 0.09))
-        fbox.setAutoresizingMask_(34); v.addSubview_(fbox)
-        self.models_field = self._field(v, il, self._cy(fcard_top, 0, 26), iw - 220, "", mask=34)
-        self.models_field.setStringValue_(models_dir())
-        self._ibtn(v, "folder", ir - 210, self._cy(fcard_top, 0, 26), "browseModelsDir:",
-                   w=40, tip="Огляд…", mask=33)
-        self._btn(v, "Застосувати", ir - 160, self._cy(fcard_top, 0, 26), 160, "applyModelsDir:",
-                  h=26, mask=33)
-        fh = self._lbl(v, "Після зміни — перезапусти Ollama в меню панелі.",
-                       il, self._cy(fcard_top, 1, 16), iw, gray=True, h=14, mask=34)
+    @objc.python_method
+    def _mk_step(self, sym, tag, action="tokStep:"):
+        b = self._al(_HoverButton.alloc().init())
+        b.setBordered_(False); b.setTitle_(sym); b.setFont_(NSFont.systemFontOfSize_(16.0))
+        b.setTag_(tag); b.setTarget_(self); b.setAction_(action)
+        b.widthAnchor().constraintEqualToConstant_(32).setActive_(True)
+        return b
 
-        # ── БІБЛІОТЕКА (огляд + пошук; росте з висотою вікна) ──
-        lib_top = y
-        hg = self._lbl(v, "БІБЛІОТЕКА МОДЕЛЕЙ", x0 + 4, lib_top - 15, cw, gray=True, h=14, mask=10)
-        hg.setFont_(NSFont.systemFontOfSize_(11.0))
-        box_top = lib_top - LP_HDR
-        box_bottom = fgrp_top + 24
-        box = NSBox.alloc().initWithFrame_(NSMakeRect(x0, box_bottom, cw, box_top - box_bottom))
-        box.setBoxType_(4); box.setTitlePosition_(0); box.setCornerRadius_(10.0)
+    @objc.python_method
+    def _atok(self):
+        """Нативний степер ± «Відповідь, токенів» у заокругленій плашці."""
+        try: self.tok_idx = TOKEN_OPTS.index(str(load_cfg().get("num_predict", 2048)))
+        except ValueError: self.tok_idx = 2
+        box = self._al(NSBox.alloc().init())
+        box.setBoxType_(4); box.setTitlePosition_(0); box.setCornerRadius_(7.0)
         box.setBorderWidth_(1.0); box.setBorderColor_(NSColor.separatorColor())
-        box.setFillColor_(NSColor.colorWithWhite_alpha_(0.5, 0.09))
-        box.setAutoresizingMask_(18); v.addSubview_(box)
-        # рядок 1: джерело (segmented) · сортування · оновити-іконка
-        cy = box_top - LP_PAD - 26
-        seg = NSSegmentedControl.alloc().initWithFrame_(NSMakeRect(il, cy, 200, 26))
-        seg.setSegmentCount_(2); seg.setSegmentStyle_(1)
-        seg.setLabel_forSegment_("Ollama", 0)
-        seg.setLabel_forSegment_("HuggingFace", 1)
-        seg.setWidth_forSegment_(70, 0); seg.setWidth_forSegment_(120, 1)
-        seg.setSelectedSegment_(1)               # дефолт — HuggingFace (більше GGUF)
-        try: seg.setSelectedSegmentBezelColor_(accent_color())   # акцент, не системний синій
+        box.setFillColor_(self._card_tint()); self._cards.append(box)
+        box.setContentViewMargins_(NSMakeSize(0, 0))
+        minus = self._mk_step("−", -1); plus = self._mk_step("+", 1)
+        self.tok_num = self._albl(TOKEN_OPTS[self.tok_idx]); self.tok_num.setAlignment_(2)
+        self.tok_num.widthAnchor().constraintEqualToConstant_(52).setActive_(True)
+        h = self._hstack(0)
+        for w in (minus, self.tok_num, plus): h.addArrangedSubview_(w)
+        box.setContentView_(h); self._fillx(h, box)
+        h.topAnchor().constraintEqualToAnchor_(box.topAnchor()).setActive_(True)
+        h.bottomAnchor().constraintEqualToAnchor_(box.bottomAnchor()).setActive_(True)
+        box.heightAnchor().constraintEqualToConstant_(28).setActive_(True)
+        box.widthAnchor().constraintEqualToConstant_(124).setActive_(True)
+        return box
+
+    @objc.python_method
+    def _actx(self):
+        """Степер ± «Контекст, токенів» (num_ctx) — скільки тексту модель «памʼятає»
+        за раз. Крокає по CTX_OPTS; стан → self.ctx_idx, cfg num_ctx."""
+        try: self.ctx_idx = CTX_OPTS.index(str(load_cfg().get("num_ctx", 4096)))
+        except ValueError: self.ctx_idx = 1
+        box = self._al(NSBox.alloc().init())
+        box.setBoxType_(4); box.setTitlePosition_(0); box.setCornerRadius_(7.0)
+        box.setBorderWidth_(1.0); box.setBorderColor_(NSColor.separatorColor())
+        box.setFillColor_(self._card_tint()); self._cards.append(box)
+        box.setContentViewMargins_(NSMakeSize(0, 0))
+        minus = self._mk_step("−", -1, "ctxStep:"); plus = self._mk_step("+", 1, "ctxStep:")
+        self.ctx_num = self._albl(CTX_OPTS[self.ctx_idx]); self.ctx_num.setAlignment_(2)
+        self.ctx_num.widthAnchor().constraintEqualToConstant_(52).setActive_(True)
+        h = self._hstack(0)
+        for w in (minus, self.ctx_num, plus): h.addArrangedSubview_(w)
+        box.setContentView_(h); self._fillx(h, box)
+        h.topAnchor().constraintEqualToAnchor_(box.topAnchor()).setActive_(True)
+        h.bottomAnchor().constraintEqualToAnchor_(box.bottomAnchor()).setActive_(True)
+        box.heightAnchor().constraintEqualToConstant_(28).setActive_(True)
+        box.widthAnchor().constraintEqualToConstant_(124).setActive_(True)
+        return box
+
+    @objc.python_method
+    def _page_models(self, *_):
+        # — Активна модель —
+        self.model_pop = self._al(NSPopUpButton.alloc().initWithFrame_pullsDown_(
+            NSMakeRect(0, 0, 10, 24), False))
+        self.model_pop.setTarget_(self); self.model_pop.setAction_("modelChanged:")
+        self.model_pop.setFocusRingType_(1)
+        self.model_pop.widthAnchor().constraintGreaterThanOrEqualToConstant_(220).setActive_(True)
+        self.loaded_lbl = self._albl("—", gray=True)
+        # довгий HF-шлях НЕ має з'їдати лейбл «У RAM зараз» — хай обрізається сам
+        try: self.loaded_lbl.cell().setLineBreakMode_(5)   # TruncatingMiddle
         except Exception: pass
-        seg.setTarget_(self); seg.setAction_("sourceChanged:"); seg.setAutoresizingMask_(8)
-        v.addSubview_(seg); self.lib_seg = seg
-        ref_x = ir - 30
-        self.lib_refresh_btn = self._ibtn(v, "arrow.clockwise", ref_x, cy, "libRefresh:",
-                   w=30, h=26, mask=9, tip="Оновити список")
-        sp = NSPopUpButton.alloc().initWithFrame_pullsDown_(
-            NSMakeRect(il + 210, cy, ref_x - 10 - (il + 210), 26), False)
-        # дефолт = за розміром (від найменшого) — ключова ідея: підбирати під слабке залізо
-        sp.addItemsWithTitles_(["↑ Розмір", "↓ Завантаження", "А-Я Назва"])
-        sp.setTarget_(self); sp.setAction_("sortChanged:"); sp.setAutoresizingMask_(10)
-        sp.setFocusRingType_(1)
-        sp.selectItemAtIndex_(0)
-        v.addSubview_(sp); self.lib_sortpop = sp
-        # рядок 2: пошук
-        sy = cy - 8 - 26
-        self.lib_search = self._field(v, il, sy, iw, "Пошук моделі…", mask=10)
+        self.loaded_lbl.setContentCompressionResistancePriority_forOrientation_(
+            100, NSUserInterfaceLayoutOrientationHorizontal)
+        self.load_btn = self._abtn("У RAM", "loadModel:", symbol="arrow.down.circle")
+        unload = self._abtn("Вивантажити", "unloadModel:")
+        delete = self._abtn("Видалити", "deleteModel:", danger=True)
+        active = self._section("Активна модель", [
+            self._arow("Модель", self.model_pop),
+            self._arow("У RAM зараз", self.loaded_lbl),
+            self._arow(self._hstack_pair(self.load_btn, unload), delete)])
+        # КРИТИЧНО: _arow підняв резистанс до 751 → довга назва тисла лівий лейбл.
+        # Опускаємо ПІСЛЯ збірки → обрізаються самі (loaded_lbl + назва моделі в popup).
+        self.loaded_lbl.setContentCompressionResistancePriority_forOrientation_(
+            1, NSUserInterfaceLayoutOrientationHorizontal)
+        self.model_pop.setContentCompressionResistancePriority_forOrientation_(
+            1, NSUserInterfaceLayoutOrientationHorizontal)
+        try: self.model_pop.cell().setLineBreakMode_(5)   # TruncatingMiddle
+        except Exception: pass
+        # — Генерація —
+        gen = self._section("Генерація", [
+            self._arow(
+                self._titled("Відповідь, токенів", "довша відповідь — більше RAM і часу"),
+                self._atok()),
+            self._arow(
+                self._titled("Контекст, токенів", "скільки тексту модель памʼятає — більше RAM"),
+                self._actx())])
+        # — Завантажити нову —
+        self.pull_field = self._afield("qwen3:4b-instruct-2507-q4_K_M")
+        self.pull_field.setStringValue_("qwen3:4b-instruct-2507-q4_K_M")
+        self.pull_field.setDelegate_(self)
+        # ✕ всередині поля справа — стерти весь текст одним кліком
+        self.pull_clear = self._abtn("", "clearPull:", symbol="xmark", tip="Очистити")
+        self.pull_clear.setBordered_(False)
+        self.pull_field.addSubview_(self.pull_clear)
+        NSLayoutConstraint.activateConstraints_([
+            self.pull_clear.trailingAnchor().constraintEqualToAnchor_constant_(
+                self.pull_field.trailingAnchor(), -4),
+            self.pull_clear.centerYAnchor().constraintEqualToAnchor_(
+                self.pull_field.centerYAnchor()),
+            self.pull_clear.widthAnchor().constraintEqualToConstant_(18),
+            self.pull_clear.heightAnchor().constraintEqualToConstant_(18)])
+        self.pull_btn = self._abtn("Завантажити", "doPull:", symbol="square.and.arrow.down")
+        self.pull_bar = self._al(NSProgressIndicator.alloc().init())
+        self.pull_bar.setStyle_(0); self.pull_bar.setIndeterminate_(False)
+        self.pull_bar.setMinValue_(0.0); self.pull_bar.setMaxValue_(100.0)
+        self.pull_bar.setHidden_(True)
+        self.pull_bar.heightAnchor().constraintEqualToConstant_(8).setActive_(True)
+        # скасування — лише поки триває завантаження (симетрично з show/hide pull_bar)
+        self.pull_cancel_btn = self._abtn("Скасувати", "cancelPull:", symbol="xmark.circle")
+        self.pull_cancel_btn.setHidden_(True)
+        self.pull_status = self._albl("ollama.com/library  ·  hf.co/<repo>:Q4_K_M",
+                                      gray=True, size=11.0)
+        try: self.pull_status.cell().setLineBreakMode_(5)
+        except Exception: pass
+        # картка лише з полем+кнопкою; прогрес-бар і підказка — ПІД карткою (без
+        # розділювачів-ліній, що з'являлись між рядками картки → виглядало брудно).
+        pull = self._section("Завантажити нову", [
+            self._arow(self.pull_field, self.pull_btn)])
+        pull.addArrangedSubview_(self.pull_bar); self._fillx(self.pull_bar, pull)
+        pull.addArrangedSubview_(self.pull_cancel_btn)
+        pull.addArrangedSubview_(self.pull_status); self._fillx(self.pull_status, pull)
+        self._update_pull_btn()
+        # — Папка моделей —
+        self.models_field = self._afield("")
+        self.models_field.setStringValue_(models_dir())
+        self.models_field.setFont_(NSFont.monospacedSystemFontOfSize_weight_(11.5, 0.0))
+        mdir_btns = self._hstack_pair(
+            self._abtn("", "browseModelsDir:", symbol="folder", tip="Огляд…"),
+            self._abtn("Застосувати", "applyModelsDir:"))
+        mdir = self._section("Папка моделей", [self._arow(self.models_field, mdir_btns)])
+        # — Бібліотека моделей —
+        self.lib_seg = SlidingSegment.alloc().initWithLabels_frame_(
+            ["Ollama", "HuggingFace"], NSMakeRect(0, 0, 210, 28))
+        self._al(self.lib_seg); self.lib_seg.setSelectedSegment_(1)
+        self.lib_seg.setTarget_action_(self, "sourceChanged:")
+        self.lib_seg.widthAnchor().constraintEqualToConstant_(210).setActive_(True)
+        self.lib_seg.heightAnchor().constraintEqualToConstant_(28).setActive_(True)
+        self.lib_refresh_btn = self._abtn("", "libRefresh:", symbol="arrow.clockwise",
+                                          tip="Оновити список")
+        self.lib_sortpop = self._apopup(
+            ["Сортувати: розмір ↑", "Сортувати: завантаження ↓", "Сортувати: назва"],
+            "Сортувати: розмір ↑", "sortChanged:")
+        self.lib_search = self._afield("Пошук моделі…")
         self.lib_search.setTarget_(self); self.lib_search.setAction_("libSearch:")
-        # таблиця (2 колонки: модель · розмір) — тягнеться по висоті
-        t_top = sy - 8
-        t_bot = box_bottom + LP_PAD
-        sc = NSScrollView.alloc().initWithFrame_(NSMakeRect(il, t_bot, iw, t_top - t_bot))
-        sc.setHasVerticalScroller_(True); sc.setBorderType_(0)
-        sc.setDrawsBackground_(False); sc.setAutoresizingMask_(18)
-        sc.setFocusRingType_(1)
-        table = NSTableView.alloc().initWithFrame_(NSMakeRect(0, 0, iw, t_top - t_bot))
-        table.setRowHeight_(22.0); table.setHeaderView_(None)
-        table.setFocusRingType_(1)
-        table.setBackgroundColor_(NSColor.clearColor())
-        table.setColumnAutoresizingStyle_(1)     # рівномірно
-        cN = NSTableColumn.alloc().initWithIdentifier_("name"); cN.setWidth_(iw - 96)
+        sc = self._al(NSScrollView.alloc().init())
+        sc.setHasVerticalScroller_(True); sc.setBorderType_(0)   # без квадратного bezel — список лежить на площині картки
+        sc.setDrawsBackground_(False); sc.setFocusRingType_(1)
+        sc.setWantsLayer_(True)                                  # заокруглені кути блоку-списку → не читається квадратом
+        sc.layer().setCornerRadius_(8.0); sc.layer().setMasksToBounds_(True)
+        sc.heightAnchor().constraintEqualToConstant_(240).setActive_(True)
+        table = NSTableView.alloc().initWithFrame_(NSMakeRect(0, 0, 400, 240))
+        table.setRowHeight_(26.0); table.setHeaderView_(None); table.setFocusRingType_(1)
+        table.setBackgroundColor_(NSColor.clearColor()); table.setColumnAutoresizingStyle_(1)
+        table.setSelectionHighlightStyle_(-1)       # None: AppKit не малює повноширинний прямокутник → заокруглену дає ChatRowView (як список чатів)
+        table.setAllowsMultipleSelection_(False)    # рівно одна модель за раз (баг «вибираються декілька»)
+        table.setAllowsEmptySelection_(True); table.setAllowsColumnSelection_(False)
+        table.setGridStyleMask_(2)                  # тонкі горизонтальні hairline між рядками (як у HTML)
+        try: table.setGridColor_(NSColor.separatorColor())
+        except Exception: pass
+        table.setIntercellSpacing_(NSMakeSize(0, 0))
+        cN = NSTableColumn.alloc().initWithIdentifier_("name"); cN.setWidth_(300)
         cS = NSTableColumn.alloc().initWithIdentifier_("size"); cS.setWidth_(80)
-        cS.dataCell().setAlignment_(2)           # розмір — праворуч
-        cS.dataCell().setTextColor_(NSColor.secondaryLabelColor())
+        cS.dataCell().setAlignment_(2); cS.dataCell().setTextColor_(NSColor.secondaryLabelColor())
         table.addTableColumn_(cN); table.addTableColumn_(cS)
         table.setDataSource_(self); table.setDelegate_(self)
         table.setTarget_(self); table.setDoubleAction_("libPick:")
-        sc.setDocumentView_(table)
-        v.addSubview_(sc); self.lib_table = table
-        # заглушка (офлайн / порожньо) — по центру таблиці, 2 рядки
-        self.lib_empty = self._lbl(v, "", il, (t_top + t_bot) / 2.0 - 22,
-                                   iw, gray=True, h=44, mask=18, align=1)
-        try:
-            self.lib_empty.cell().setWraps_(True)
-            self.lib_empty.cell().setAlignment_(1)   # 1 = центр (UIKit-style enum)
-        except Exception: pass
-        self.lib_empty.setHidden_(True)
-        # підказка дії (пришпилена до низу, над папкою)
-        self.lib_detail = self._lbl(
-            v, "Подвійний клік — у поле «Завантажити».  HF → hf.co/repo:Q4_K_M",
-            il, fgrp_top + 4, iw, gray=True, h=16, mask=34)
-        self.lib_detail.setFont_(NSFont.systemFontOfSize_(11.0))
+        sc.setDocumentView_(table); self.lib_table = table
+        self.lib_empty = self._albl("", gray=True); self.lib_empty.setHidden_(True)
+        self.lib_detail = self._albl(
+            "Подвійний клік — у поле «Завантажити».  HF → hf.co/repo:Q4_K_M",
+            gray=True, size=11.0)
+        lib_hdr = self._albl("Бібліотека моделей", gray=True, size=12.0)
+        # ЄДИНА картка (як у HTML-мокапі): керування + пошук + сам список разом,
+        # sep=False → без товстих ліній-роздільників між блоками всередині.
+        lib_card = self._card([
+            self._arow(self.lib_seg,
+                       self._hstack_pair(self.lib_sortpop, self.lib_refresh_btn)),
+            self.lib_search,
+            sc], sep=False, gap=8)
+        lib = self._vstack(7)
+        for c in (lib_hdr, lib_card, self.lib_empty, self.lib_detail):
+            lib.addArrangedSubview_(c); self._fillx(c, lib)
+        # стан бібліотеки
         self.lib_all = []; self.lib_filtered = []
         self.lib_size_cache = {}; self.lib_size_pending = set()
         self._size_prefetch_busy = False
         self.lib_source = "hf"; self.lib_sort = "size"; self.lib_online = True
-        self._refresh_library()
+        # ЄДИНА підказка-джерело: pull_status (він же показує прогрес завантаження).
+        # Дубль-хінт під карткою прибрано — дві однакові строчки не мали сенсу.
+        page = self._page([active, gen, pull,
+            self._group(mdir, "Стандартний шлях Ollama: ~/.ollama/models · "
+                              "Після зміни — перезапусти Ollama в меню панелі."),
+            lib])
+        try:
+            self.reload_models(); self._refresh_library()
+        except Exception: pass
+        return page
+
+    @objc.python_method
+    def _accent_css(self):
+        """Системний акцент (NSColor.controlAccentColor) → rgb(...) для CSS-зміни --accent."""
+        try:
+            c = NSColor.controlAccentColor().colorUsingColorSpaceName_("NSCalibratedRGBColorSpace")
+            r, g, b = int(c.redComponent() * 255), int(c.greenComponent() * 255), int(c.blueComponent() * 255)
+            return f"rgb({r},{g},{b})"
+        except Exception:
+            return "#007AFF"
+
+    @objc.python_method
+    def _settings_state(self):
+        """Поточний стан → словник для проштовхування у JS (заповнює контроли мокапа)."""
+        cfg = load_cfg()
+        p = self.panel
+        loaded = ps_loaded()
+        loaded_txt = "—  (RAM вільна)"
+        if loaded:
+            nm = loaded[0].split("  ")[0].strip(); sz = ram_size(loaded[0])
+            loaded_txt = nm + (f"  ·  {sz}" if sz else "")
+        ms = list_models()
+        sel = self.sel_model if self.sel_model in ms else (pick_chat_model(ms) if ms else None)
+        return {
+            "theme": cfg.get("theme", "Авто"),
+            "transp": int(cfg.get("transp", 70)),
+            "autoLogin": bool(cfg.get("autostart_login")),
+            "autoOllama": bool(cfg.get("autostart_ollama")),
+            "autoTts": bool(cfg.get("autostart_tts")),
+            "optFlash": bool(cfg.get("ollama_flash", True)),
+            "optKv": bool(cfg.get("ollama_kv_q8", True)),
+            "chatsDir": chats_dir(),
+            "modelsDir": models_dir(),
+            "voices": [voice_label(x) for x in VOICES],
+            "voiceIdx": VOICES.index(p.voice) if p.voice in VOICES else 0,
+            "speed": float(getattr(p, "speed", 1.0)),
+            "volume": float(getattr(p, "volume", 0.85)),
+            "pause": float(getattr(p, "pause", 0.15)),
+            "ttsMode": {"base": 0, "stream": 1, "realtime": 2}.get(tts_mode(), 0),
+            "ramUnload": int(cfg.get("ram_unload", 5)),
+            "devices": [n for (n, u) in ([("Системний за замовч.", None)] + audio_outputs())],
+            "outIdx": 0,
+            "models": ms or [],
+            "selModel": sel,
+            "loaded": loaded_txt,
+            "token": int(cfg.get("num_predict", 1024)),
+            "hotkeys": {k: fmt_hotkey(v) for k, v in cfg.get("hotkeys", DEFAULT_HOTKEYS).items()},
+        }
+
+    @objc.python_method
+    def _inject_settings(self, html):
+        """Вшиває системний акцент (CSS) + початковий стан (window.__STATE__) у HTML
+        перед </head>, щоб binding-скрипт мокапа заповнив контроли реальними даними."""
+        import json
+        st = self._settings_state()
+        # вибраний пристрій виводу за UID
+        uids = [None] + [u for (n, u) in audio_outputs()]
+        cur = getattr(self.panel, "out_device", None)
+        st["outIdx"] = uids.index(cur) if cur in uids else 0
+        inj = ("<style>:root{--accent:%s!important}</style>"
+               "<script>window.__STATE__=%s;</script>") % (self._accent_css(), json.dumps(st))
+        return html.replace("</head>", inj + "</head>", 1)
+
+    @objc.python_method
+    def _set_js(self, script):
+        """Виконати JS у settings-webview (проштовхування стану назад у мокап)."""
+        w = getattr(self, "set_web", None)
+        if w is None: return
+        AppHelper.callAfter(lambda: w.evaluateJavaScript_completionHandler_(script, None))
+
+    @objc.python_method
+    def _ui_action(self, body):
+        """Диспетч повідомлень із settings-мокапа (міст HTML→Python). body = {a, v, key}."""
+        try: a = str(body.objectForKey_("a") or "")
+        except Exception: return
+        v = body.objectForKey_("v")
+        key = body.objectForKey_("key")
+        cfg = load_cfg()
+        if a == "theme":
+            val = str(v); cfg["theme"] = val; save_cfg(cfg)
+            try: apply_theme(val)
+            except Exception: pass
+        elif a == "transp":
+            try: iv = int(v)
+            except Exception: iv = 70
+            cfg["transp"] = iv; save_cfg(cfg)
+            # NB: тимчасово — alpha всього вікна (делікатно). Справжня прозорість лише фону
+            # (текст лишається чітким) = vibrancy-підкладка, у стадії полірування.
+            try: self.win.setAlphaValue_(max(0.78, 1.0 - iv / 100.0 * 0.22))
+            except Exception: pass
+        elif a == "autoLogin":
+            on = bool(v); ok = set_login_item(on)
+            cfg["autostart_login"] = bool(on and ok); save_cfg(cfg)
+            if not ok:
+                self._set_js("setSw('autoLogin',false)")
+                rumps.notification("KobzarAI", "Не вдалося внести в автозапуск входу",
+                                   "Додай вручну: Системні налаштування → Загальні → Елементи входу")
+        elif a == "autoOllama": cfg["autostart_ollama"] = bool(v); save_cfg(cfg)
+        elif a == "autoTts":    cfg["autostart_tts"] = bool(v); save_cfg(cfg)
+        elif a == "optFlash":   cfg["ollama_flash"] = bool(v); save_cfg(cfg)
+        elif a == "optKv":      cfg["ollama_kv_q8"] = bool(v); save_cfg(cfg)
+        elif a == "chatsFinder": self.revealChatsDir_(None)
+        elif a == "chatsFolder":
+            p = NSOpenPanel.openPanel()
+            p.setCanChooseDirectories_(True); p.setCanChooseFiles_(False)
+            p.setAllowsMultipleSelection_(False); p.setPrompt_("Вибрати")
+            if p.runModal() == 1:
+                path = str(p.URLs()[0].path())
+                cfg["chats_dir"] = path or None; save_cfg(cfg)
+                self.sessions = load_chats() or [
+                    {"title": "Чат 1", "history": [], "ts": time.time(),
+                     "id": str(int(time.time() * 1000))}]
+                self.cur = 0
+                self._set_js("kobzar.setChatsDir(%s)" % json.dumps(chats_dir()))
+        elif a == "uninstall": self.uninstallApp_(None)
+        elif a == "hk":
+            # запис хоткея: поки лишаємо нативний потік (NSEvent capture) — стадія далі
+            pass
+
+    # ---------- вкладка: ГОЛОС (лише озвучення) ----------
 
     # ---------- вкладка 3: міні-чат ----------
     @objc.python_method
     def _build_chat(self, v, CW, CH):
         M = LP_M
-        red = NSColor.systemRedColor()
-        org = NSColor.systemOrangeColor()
-        # ── верхній рядок: модель (зліва) · ＋новий · 🗑очистити · історія (справа) ──
+        # ── ліва колонка: список чатів (sidebar, як Claude/ChatGPT) · права: сам чат ──
         ty = CH - 30
-        self.hist_pop = NSPopUpButton.alloc().initWithFrame_pullsDown_(
-            NSMakeRect(CW - M - 190, ty - 4, 190, 26), False)
-        self.hist_pop.setTarget_(self); self.hist_pop.setAction_("histChanged:")
-        self.hist_pop.setFocusRingType_(1)
-        self.hist_pop.setAutoresizingMask_(9)  # верх-право
-        v.addSubview_(self.hist_pop)
-        xclr = CW - M - 190 - 8 - 30
-        xnew = xclr - 6 - 30
-        self._ibtn(v, "trash", xclr, ty - 4, "clearChat:", w=30, mask=9,
-                   tip="Очистити", color=NSColor.secondaryLabelColor())
-        self._ibtn(v, "plus", xnew, ty - 4, "newChat:", w=30, mask=9,
-                   tip="Новий чат", color=accent_color())
-        self.chat_model_lbl = self._lbl(v, "", M, ty, xnew - M - 10, gray=True, mask=10)
-        # ── низ (знизу вгору): службовий рядок · ввід-пігулка · транскрипт ──
-        svc_y = 12
-        pill_y = 42
+        x0 = M + LP_SBW + LP_SBG          # ліва межа колонки чату (список pinned-left, фікс. ширина)
+        cw = CW - x0 - M                  # ширина колонки чату — тягнеться з вікном
+        sb_top = ty + 22
+        sb_bot = 12
+        # шапка списку: «Новий чат» на всю ширину. Кошик прибрано — деструктив
+        # впритул до креативу (пастка Фіттса); видалення живе в контекст-меню чату.
+        nb_h = 28
+        nb_y = sb_top - nb_h
+        self._btn(v, "Новий чат", M, nb_y, LP_SBW, "newChat:", h=nb_h,
+                  mask=12, symbol="plus", sym_pt=11)   # тонший + (пін-топ, НЕ розтягувати)
+        # список — без рамки-картки (площина, не бокс); роздільник колонки — окремою лінією
+        list_top = nb_y - 10
+        sc_l = NSScrollView.alloc().initWithFrame_(
+            NSMakeRect(M, sb_bot, LP_SBW, list_top - sb_bot))
+        sc_l.setDrawsBackground_(False); sc_l.setBorderType_(0)
+        sc_l.setHasVerticalScroller_(True); sc_l.setAutohidesScrollers_(True)
+        sc_l.setFocusRingType_(1)
+        sc_l.setAutoresizingMask_(20)     # ліво-фікс, висота тягнеться з вікном
+        # вертикальний роздільник між списком і чатом (тонка лінія, як у Apple Notes/Mail)
+        sep = NSBox.alloc().initWithFrame_(
+            NSMakeRect(M + LP_SBW + (LP_SBG - 1) / 2.0, sb_bot, 1, sb_top - sb_bot))
+        sep.setBoxType_(2); sep.setBorderColor_(NSColor.separatorColor())
+        sep.setAutoresizingMask_(20); v.addSubview_(sep)
+        tbl = _ChatTable.alloc().initWithFrame_(NSMakeRect(0, 0, LP_SBW, 10))
+        col = NSTableColumn.alloc().initWithIdentifier_("title")
+        col.setWidth_(LP_SBW - 4); col.setEditable_(False)
+        tbl.addTableColumn_(col); tbl.setHeaderView_(None)
+        tbl.setRowHeight_(46.0); tbl.setIntercellSpacing_(NSMakeSize(0, 2))
+        tbl.setBackgroundColor_(NSColor.clearColor())
+        tbl.setSelectionHighlightStyle_(-1)           # None: AppKit нічого не малює (ні підсвітки, ні menu-ring) → лише наша в ChatRowView.drawBackgroundInRect_
+        tbl.setFocusRingType_(1)                      # без синього focus-ring
+        tbl.setAllowsEmptySelection_(False); tbl.setAllowsMultipleSelection_(False)
+        tbl.setDataSource_(self); tbl.setDelegate_(self)
+        tbl.setMenu_(self._chat_row_menu())           # контекст-меню по рядку (правий клік)
+        sc_l.setDocumentView_(tbl)
+        v.addSubview_(sc_l); self.hist_tbl = tbl
+        # шапка чату: крапка-статус (зелена=Ollama up / сіра=down) + модель truncate + розмір справа
+        dot = NSView.alloc().initWithFrame_(NSMakeRect(x0, ty + 5, 7, 7))
+        dot.setWantsLayer_(True)
+        dot.layer().setCornerRadius_(3.5)
+        dot.layer().setBackgroundColor_(NSColor.tertiaryLabelColor().CGColor())
+        dot.setAutoresizingMask_(8)             # пін ліво-верх, фікс
+        v.addSubview_(dot); self.chat_dot = dot
+        self.chat_model_lbl = self._lbl(v, "", x0 + 14, ty, cw - 110, gray=True, mask=10)
+        try: self.chat_model_lbl.cell().setLineBreakMode_(4)   # задовга назва → обрізати хвостом
+        except Exception: pass
+        self.chat_size_lbl = self._lbl(v, "", x0 + cw - 90, ty, 90, gray=True, mask=9, align=1)
+        # кнопка-дія прямо в статусі: апка сама вміє стартувати Ollama — не відсилаємо в меню
+        self.chat_start_btn = self._btn(v, "Запустити", x0 + cw - 100, ty - 3, 100,
+                                        "chatStartOllama:", h=24, mask=9)
+        self.chat_start_btn.setHidden_(True)
+        # ── низ (знизу вгору): ввід-пігулка · транскрипт ──
+        # (службовий рядок прибрано: озвучка тепер гола іконка-динамік У пігулці)
+        pill_y = 14
         pill_h = 40
         tr_bottom = pill_y + pill_h + 12
         tr_top = ty - 12
-        frame = NSMakeRect(M, tr_bottom, CW - 2 * M, tr_top - tr_bottom)
-        web = WKWebView.alloc().initWithFrame_configuration_(
-            frame, WKWebViewConfiguration.alloc().init())
+        frame = NSMakeRect(x0, tr_bottom, cw, tr_top - tr_bottom)
+        cfg = WKWebViewConfiguration.alloc().init()
+        try:                                   # нативний міст копіювання (надійніше за execCommand)
+            ucc = cfg.userContentController()
+            for nm in ("copy", "speak", "regen", "open"):
+                ucc.removeScriptMessageHandlerForName_(nm)
+                ucc.addScriptMessageHandler_name_(self, nm)
+        except Exception:
+            pass
+        web = WKWebView.alloc().initWithFrame_configuration_(frame, cfg)
         web.setNavigationDelegate_(self)
         web.setAutoresizingMask_(18)
-        # рамка-картка довкола чату (як панель у референсах)
         web.setWantsLayer_(True)
-        try:
-            web.layer().setCornerRadius_(12.0)
-            web.layer().setMasksToBounds_(True)
-            web.layer().setBorderWidth_(1.0)
-            web.layer().setBorderColor_(NSColor.separatorColor().CGColor())
+        try:                                   # площина без рамки-боксу (iMessage-вайб)
+            web.setValue_forKey_(False, "drawsBackground")
         except Exception:
             pass
         v.addSubview_(web); self.web = web
         web.loadHTMLString_baseURL_(chat_html(), None)
-        # ── ввід-пігулка: [ поле … ⏹ ◉ ] — одна заокруглена смуга, як Claude/iMessage ──
-        pill = NSBox.alloc().initWithFrame_(NSMakeRect(M, pill_y, CW - 2 * M, pill_h))
+        # ── ввід-пігулка: [ поле … stop send ] — одна заокруглена смуга, як Claude/iMessage ──
+        pill = NSBox.alloc().initWithFrame_(NSMakeRect(x0, pill_y, cw, pill_h))
         pill.setBoxType_(4); pill.setTitlePosition_(0)
         pill.setCornerRadius_(pill_h / 2.0); pill.setBorderWidth_(1.0)
         pill.setBorderColor_(NSColor.separatorColor())
@@ -1624,17 +2854,23 @@ class SettingsWindow(NSObject):
         pill.setAutoresizingMask_(34)              # ширина тягнеться, пін до низу
         v.addSubview_(pill); self.chat_pill = pill
         send_d = 30
-        sx = CW - M - 9 - send_d
-        stx = sx - 4 - 26
-        in_x = M + 16
-        in_w = stx - 10 - in_x
+        sx = CW - M - 9 - send_d          # send (крайня права, морфиться ↑↔⏹)
+        spk_d = 28
+        spk_x = sx - 6 - spk_d            # динамік-озвучка — ліворуч від send, у пігулці
+        kb_d = 26
+        kb_x = spk_x - 4 - kb_d           # тумблер бази знань — ліворуч від динаміка
+        in_x = x0 + 16
+        in_w = kb_x - 10 - in_x
         # багаторядкове поле: Enter — надіслати, Shift+Enter — новий рядок (NSTextView,
         # бо NSTextField однорядковий і Shift+Enter у ньому неможливий).
         in_h = 26
         # плейсхолдер ДОДАЄМО ПЕРШИМ (позаду поля) — інакше він перекриває NSTextView
         # і краде кліки (поле не клікалось). Поле зверху → клікабельне; текст прозорий → видно.
-        self.chat_ph = self._lbl(v, "Запит…  (Enter — надіслати · Shift+Enter — новий рядок)",
+        self.chat_ph = self._lbl(v, "Запит…  (Enter — надіслати)",
                                  in_x + 4, pill_y + (pill_h - 18) / 2.0, in_w - 8, gray=True, mask=34)
+        # приглушити плейсхолдер: secondaryLabel занадто яскравий → tertiary (як у мокапі)
+        try: self.chat_ph.setTextColor_(NSColor.placeholderTextColor())
+        except Exception: pass
         sc = NSScrollView.alloc().initWithFrame_(
             NSMakeRect(in_x, pill_y + (pill_h - in_h) / 2.0, in_w, in_h))
         sc.setDrawsBackground_(False); sc.setBorderType_(0)
@@ -1651,45 +2887,199 @@ class SettingsWindow(NSObject):
         sc.setDocumentView_(tv)
         v.addSubview_(sc); self.chat_sc = sc
         self.chat_input = tv
-        self.chat_stop = self._ibtn(v, "stop.circle", stx, pill_y + (pill_h - 26) / 2.0, "stopGen:",
-                   w=26, h=26, mask=33, tip="Зупинити генерацію", color=red)
+        # озвучка = гола іконка-динамік у пігулці (on=акцент / off=сірий); режими — у вкладці «Голос»
+        self.autospeak = self._spkbtn(v, spk_x, pill_y + (pill_h - spk_d) / 2.0, spk_d)
+        self.chat_kb = self._kbbtn(v, kb_x, pill_y + (pill_h - kb_d) / 2.0, kb_d)
         self.send_btn = self._sendbtn(v, sx, pill_y + (pill_h - send_d) / 2.0, send_d)
-        # ── службовий рядок: озвучка (ліво) · пауза/стоп (поруч) ──
-        self.autospeak = NSButton.alloc().initWithFrame_(NSMakeRect(M, svc_y, 175, 22))
-        self.autospeak.setButtonType_(3)
-        self.autospeak.setTitle_("Озвучувати відповіді")
-        self.autospeak.setTarget_(self); self.autospeak.setAction_("autospeakToggled:")
-        self.autospeak.setAutoresizingMask_(32)
-        v.addSubview_(self.autospeak)
-        self._acc_check(self.autospeak)
-        self._ibtn(v, "pause.fill", M + 182, svc_y - 2, "pauseSpeechBtn:", w=30,
-                   mask=32, tip="Пауза / продовжити", color=org)
-        self._ibtn(v, "stop.fill", M + 182 + 36, svc_y - 2, "stopSpeechBtn:", w=30,
-                   mask=32, tip="Стоп озвучку", color=red)
+        self._sync_spk()
+        self._sync_kb()
         # «Відповідь, токенів» перенесено у вкладку «Загальні → Генерація».
         self._reload_hist()
 
     @objc.python_method
+    def _circle_sym(self, name, d, glyph, circle):
+        """Двоколірний circle.fill-символ: чітка glyph-стрілка/квадрат поверх суцільного
+        кола (як у мокапі — біла стрілка на синьому, не «вирізана» крізь тінт)."""
+        base = NSImageSymbolConfiguration.configurationWithPointSize_weight_(float(d), 0.0)
+        img = NSImage.imageWithSystemSymbolName_accessibilityDescription_(name, None)
+        if not img:
+            return None
+        try:
+            pal = NSImageSymbolConfiguration.configurationWithPaletteColors_([glyph, circle])
+            cfg = base.configurationByApplyingConfiguration_(pal)
+            img = img.imageWithSymbolConfiguration_(cfg) or img
+            img.setTemplate_(False)         # палітра несе власні кольори → НЕ template
+        except Exception:
+            img = img.imageWithSymbolConfiguration_(base) or img
+        return img
+
+    @objc.python_method
     def _sendbtn(self, view, x, y, d):
-        """Кругла акцентна кнопка надсилання (SF Symbol arrow.up.circle.fill)."""
+        """Кругла кнопка надсилання (↑). Під час генерації морфиться у червоний стоп (⏹)."""
         b = NSButton.alloc().initWithFrame_(NSMakeRect(x, y, d, d))
         b.setBordered_(False); b.setTitle_("")
-        b.setTarget_(self); b.setAction_("sendChat:")
-        cfg = NSImageSymbolConfiguration.configurationWithPointSize_weight_(float(d), 0.0)
-        img = NSImage.imageWithSystemSymbolName_accessibilityDescription_(
-            "arrow.up.circle.fill", "Надіслати")
+        b.setTarget_(self); b.setAction_("sendOrStop:")
+        img = self._circle_sym("arrow.up.circle.fill", d,
+                               NSColor.whiteColor(), accent_color())
         if img:
-            img = img.imageWithSymbolConfiguration_(cfg) or img
             b.setImage_(img); b.setImagePosition_(1)
-        try: b.setContentTintColor_(accent_color())
-        except Exception: pass
         b.setToolTip_("Надіслати"); b.setAutoresizingMask_(33)
         view.addSubview_(b)
         return b
 
+    # ---------- База знань (RAG) ----------
+    @objc.python_method
+    def _kb_db_path(self):
+        return os.path.join(os.path.dirname(chats_dir()), "knowledge", "index.db")
+
+    @objc.python_method
+    def _kb_get(self):
+        """Ліниво підняти джерело бази знань. Пріоритет: обраний ГОТОВИЙ індекс
+        (read-only, нічого не переembedить) → інакше власна проіндексована тека.
+        None → фіча недоступна (нема kb.py / джерела)."""
+        if self._kb is not None:
+            return self._kb
+        try:
+            import kb as _kbmod
+            if self.kb_index:
+                self._kb = _kbmod.open_index(self.kb_index, host=OLLAMA_HOST)
+            elif self.kb_folder:
+                self._kb = _kbmod.KB(self._kb_db_path(), host=OLLAMA_HOST)
+            else:
+                return None
+        except Exception as e:
+            try: rumps.notification("KobzarAI", "База знань недоступна", str(e)[:80])
+            except Exception: pass
+            return None
+        return self._kb
+
+    @objc.python_method
+    def _kb_retrieve(self, query):
+        """Топ-K шматків для запиту або "" (тихо, помилку ковтаємо — чат не має падати)."""
+        kb = self._kb_get()
+        if kb is None:
+            return ""
+        try:
+            import kb as _kbmod
+            hits = kb.search(query, k=6)
+            return _kbmod.build_context(hits)
+        except Exception:
+            return ""
+
+    def kbToggled_(self, sender):
+        if not (self.kb_index or self.kb_folder):
+            self._js("note('Спершу обери базу знань у Налаштування → Загальні')")
+            self.select_tab(0)
+            return
+        self.kb_on = not self.kb_on
+        cfg = load_cfg(); cfg["kb_on"] = self.kb_on; save_cfg(cfg)
+        self._sync_kb()
+
+    @objc.python_method
+    def _sync_kb(self):
+        b = getattr(self, "chat_kb", None)
+        if b is None: return
+        try:
+            b.setContentTintColor_(accent_color() if self.kb_on
+                                   else NSColor.secondaryLabelColor())
+            src = os.path.basename(self.kb_index or self.kb_folder) or "не обрано"
+            b.setToolTip_("База знань: увімкнено (%s)" % src if self.kb_on
+                          else "База знань: вимкнено")
+        except Exception: pass
+
+    @objc.python_method
+    def _kb_reindex(self, done=None):
+        """Проіндексувати kb_folder у фоні. done(stats|None, err|None) на головному потоці."""
+        if self._kb_busy:
+            return
+        folder = self.kb_folder
+        if not folder:
+            if done: AppHelper.callAfter(done, None, "не обрано теку")
+            return
+        self._kb_busy = True
+        def run():
+            err = None; stats = None
+            try:
+                import kb as _kbmod
+                kb = _kbmod.KB(self._kb_db_path(), host=OLLAMA_HOST)
+                self._kb = kb
+                if not ollama_up():
+                    self.panel._start_ollama()
+                    for _ in range(20):
+                        if ollama_up(): break
+                        time.sleep(1)
+                if not ollama_up():
+                    raise _kbmod.KBEmbedUnavailable("Ollama не запущена")
+                stats = kb.index(folder)
+            except Exception as e:
+                err = str(e)
+            finally:
+                self._kb_busy = False
+                if done: AppHelper.callAfter(done, stats, err)
+        threading.Thread(target=run, daemon=True).start()
+
+    @objc.python_method
+    def _spkbtn(self, view, x, y, d):
+        """Гола іконка-динамік у пігулці: вмикає автоозвучку відповідей. Без рамки —
+        колір несе стан (акцент=увімкнено / сірий=вимкнено); керується _sync_spk."""
+        b = NSButton.alloc().initWithFrame_(NSMakeRect(x, y, d, d))
+        b.setBordered_(False); b.setTitle_("")
+        b.setTarget_(self); b.setAction_("autospeakToggled:")
+        cfg = NSImageSymbolConfiguration.configurationWithPointSize_weight_(16.0, 0.0)
+        img = NSImage.imageWithSystemSymbolName_accessibilityDescription_(
+            "speaker.wave.2.fill", "Озвучувати відповіді")
+        if img:
+            img = img.imageWithSymbolConfiguration_(cfg) or img
+            b.setImage_(img); b.setImagePosition_(1)
+        b.setToolTip_("Озвучувати відповіді автоматично")
+        b.setAutoresizingMask_(33)
+        view.addSubview_(b)
+        return b
+
+    @objc.python_method
+    def _kbbtn(self, view, x, y, d):
+        """Тумблер «База знань» у пігулці: акцент=увімкнено. Керується _sync_kb."""
+        b = NSButton.alloc().initWithFrame_(NSMakeRect(x, y, d, d))
+        b.setBordered_(False); b.setTitle_("")
+        b.setTarget_(self); b.setAction_("kbToggled:")
+        cfg = NSImageSymbolConfiguration.configurationWithPointSize_weight_(15.0, 0.0)
+        img = NSImage.imageWithSystemSymbolName_accessibilityDescription_(
+            "books.vertical.fill", "База знань")
+        if img:
+            img = img.imageWithSymbolConfiguration_(cfg) or img
+            b.setImage_(img); b.setImagePosition_(1)
+        b.setAutoresizingMask_(33)
+        view.addSubview_(b)
+        return b
+
+    @objc.python_method
+    def _sync_spk(self):
+        """Колір динаміка = стан автоозвучки (акцент увімкнено / сірий вимкнено)."""
+        b = getattr(self, "autospeak", None)
+        if b is None: return
+        try:
+            b.setContentTintColor_(accent_color() if self.autospeak_on
+                                   else NSColor.secondaryLabelColor())
+        except Exception: pass
+
+    @objc.python_method
+    def _gen_ui(self, on):
+        """Морф кнопки надсилання під час генерації: ↑(акцент) ↔ ⏹(червоний-стоп)."""
+        self._generating = bool(on)
+        b = getattr(self, "send_btn", None)
+        if b is None: return
+        d = b.frame().size.height or 30.0
+        name = "stop.circle.fill" if on else "arrow.up.circle.fill"
+        circle = NSColor.systemRedColor() if on else accent_color()
+        img = self._circle_sym(name, d, NSColor.whiteColor(), circle)
+        if img:
+            b.setImage_(img)
+        b.setToolTip_("Зупинити генерацію" if on else "Надіслати")
+
     # ---------- дії: голос/хоткеї ----------
     def voiceChanged_(self, sender):
-        v = sender.titleOfSelectedItem()
+        idx = sender.indexOfSelectedItem()
+        v = VOICES[idx] if 0 <= idx < len(VOICES) else VOICES[0]   # підпис→серверний ключ
         self.panel.voice = v
         cfg = load_cfg(); cfg["voice"] = v; save_cfg(cfg)
 
@@ -1697,38 +3087,70 @@ class SettingsWindow(NSObject):
         sp = max(0.7, min(1.3, float(sender.floatValue())))
         self.panel.speed = sp
         if getattr(self, "speed_val", None) is not None:
-            self.speed_val.setStringValue_(f"{sp:.2f}")
+            self.speed_val.setStringValue_(f"×{sp:.2f}")
         cfg = load_cfg(); cfg["speed"] = round(sp, 2); save_cfg(cfg)
 
     def pauseChanged_(self, sender):
         pz = max(0.0, min(0.6, float(sender.floatValue())))
         self.panel.pause = pz
         if getattr(self, "pause_val", None) is not None:
-            self.pause_val.setStringValue_(f"{pz:.2f}")
+            self.pause_val.setStringValue_(f"{pz:.2f} с")
         cfg = load_cfg(); cfg["pause"] = round(pz, 2); save_cfg(cfg)
+
+    def volumeChanged_(self, sender):
+        vol = max(0.0, min(1.0, float(sender.floatValue())))
+        self.panel.volume = vol
+        if getattr(self, "vol_val", None) is not None:
+            self.vol_val.setStringValue_(f"{int(round(vol * 100))}%")
+        cfg = load_cfg(); cfg["volume"] = round(vol, 2); save_cfg(cfg)
+
+    def outDeviceChanged_(self, sender):
+        i = sender.indexOfSelectedItem()
+        uids = getattr(self, "_out_uids", [None])
+        uid = uids[i] if 0 <= i < len(uids) else None
+        self.panel.out_device = uid                    # None=системний; UID→NSSound.setPlaybackDeviceIdentifier_
+        cfg = load_cfg(); cfg["out_device"] = uid or ""; save_cfg(cfg)
+
+    @objc.python_method
+    def _preview_set(self, btn, title, red):
+        # «Прослухати» акцентна; під час відтворення морфиться у червону «Зупинити»
+        try:
+            btn.setTitle_(title)
+            btn.setBezelColor_(NSColor.systemRedColor() if red else accent_color())
+        except Exception: pass
 
     def previewVoice_(self, sender):
         # повторний клік під час відтворення → СТОП
         if self.panel._state in ("synth", "playing", "paused"):
             self.panel.stop_speech(None)
-            sender.setTitle_("Прослухати зразок")
+            self._preview_set(sender, "Прослухати", False)
             return
         sample = ("Привіт. Це зразок мого голосу. "
                   "Перевіряю швидкість і паузу між реченнями. Один, два, три.")
-        sender.setTitle_("Зупинити")
+        cold = not tts_up()                  # сервер лежить → буде холодний старт ~20 c
+        self._preview_set(sender, "Запускаю голос…" if cold else "Зупинити", True)
         def run():
+            shown_stop = [not cold]
             self.panel._speak(sample)
             # дочекатись завершення → повернути назву кнопки
             time.sleep(0.4)
             while self.panel._state in ("synth", "playing", "paused"):
+                if not shown_stop[0] and self.panel._state == "playing":
+                    shown_stop[0] = True     # звук пішов → дозволь СТОП
+                    AppHelper.callAfter(self._preview_set, sender, "Зупинити", True)
                 time.sleep(0.15)
-            AppHelper.callAfter(sender.setTitle_, "Прослухати зразок")
+            AppHelper.callAfter(self._preview_set, sender, "Прослухати", False)
         threading.Thread(target=run, daemon=True).start()
 
     def themeChanged_(self, sender):
         t = str(sender.titleOfSelectedItem())
         cfg = load_cfg(); cfg["theme"] = t; save_cfg(cfg)
         apply_theme(t)
+        # підкладка прозорості — це заморожений CGColor на CALayer (не реагує на зміну
+        # appearance). Без перерезолву він лишається кольором старої теми → білий текст
+        # нової теми на світлій підкладці = невидимо. Перефарбувати під поточну тему.
+        if getattr(self, "_glass", None) is not None:
+            self._apply_transp(self._glass)
         self._reload_web()  # чат під нову тему
 
     def accentChanged_(self, sender):
@@ -1738,7 +3160,7 @@ class SettingsWindow(NSObject):
         if self.accent_swatch is not None:
             self.accent_swatch.setFillColor_(ac)
         if self.seg is not None:
-            try: self.seg.setSelectedSegmentBezelColor_(ac)   # верхній перемикач теж перефарбувати
+            try: self.seg.reaccent()                          # верхній перемикач теж перефарбувати
             except Exception: pass
         if self.send_btn is not None:
             try: self.send_btn.setContentTintColor_(ac)
@@ -1746,8 +3168,9 @@ class SettingsWindow(NSObject):
         # галочки → новий акцент (текст не чіпаємо)
         for cb in (getattr(self, "auto_login", None), getattr(self, "auto_oll", None),
                    getattr(self, "auto_tts", None), getattr(self, "opt_flash", None),
-                   getattr(self, "opt_kv", None), getattr(self, "autospeak", None)):
+                   getattr(self, "opt_kv", None)):
             if cb is not None: self._acc_check(cb)
+        self._sync_spk()                              # динамік — іконка, не чекбокс: тінт окремо
         if self.preview_btn is not None:
             try: self.preview_btn.setBezelColor_(ac)
             except Exception: pass
@@ -1755,7 +3178,10 @@ class SettingsWindow(NSObject):
             rg.setNeedsDisplay_(True)
         self._update_pull_btn()
         for sg in (self.lib_seg, getattr(self, "tts_mode", None)):
-            if sg is not None:
+            if sg is None: continue
+            if hasattr(sg, "reaccent"):
+                sg.reaccent()
+            else:
                 try: sg.setSelectedSegmentBezelColor_(ac)
                 except Exception: pass
         # акцентні слайдери перемалювати під новий колір
@@ -1804,8 +3230,87 @@ class SettingsWindow(NSObject):
             rumps.notification("KobzarAI", "Не вдалося внести в автозапуск входу",
                                "Додай вручну: Системні налаштування → Загальні → Елементи входу")
 
+    def uninstallApp_(self, sender):
+        """Повне видалення стека KobzarAI. Деструктив + незворотно → одне явне
+        «впевнені?». Реально стирає окремий detached-скрипт (переживає вихід апки),
+        бо апка не може стерти власний bundle, поки сама виконується."""
+        app_path = None
+        try:
+            from AppKit import NSBundle
+            app_path = NSBundle.mainBundle().bundlePath()
+            if app_path and not str(app_path).endswith(".app"):
+                app_path = None
+        except Exception:
+            app_path = None
+        targets = ("• застосунок KobzarAI.app\n"
+                   "• TTS-сервер (~/.local/styletts2-ua-server)\n"
+                   "• панель і налаштування (~/.local/kobzarai)\n"
+                   "• лаунчер Ollama (~/.ollama/start-ollama.sh)")
+        if rumps.alert(
+                title="Видалити KobzarAI повністю?",
+                message="Впевнені? Це безповоротно зупинить сервіси й зітре:\n\n"
+                        f"{targets}\n\n"
+                        "Моделі на зовнішньому диску та сам Ollama (brew) "
+                        "лишаться недоторканими.",
+                ok="Видалити назавжди", cancel="Скасувати") != 1:
+            return
+        # знімаємо login-item ще з живої апки (SMAppService резолвить лише наявний bundle)
+        try: set_login_item(False)
+        except Exception: pass
+        # detached-скрипт: чекає вихід апки → стирає файли → повідомляє
+        apps = []
+        if app_path: apps.append(str(app_path))
+        apps += ["/Applications/KobzarAI.app",
+                 os.path.expanduser("~/Applications/KobzarAI.app")]
+        seen = []
+        for a in apps:
+            if a not in seen: seen.append(a)
+        rm_apps = " ".join(shlex.quote(a) for a in seen)
+        script = f"""#!/bin/bash
+sleep 1.5
+pkill -f 'ollama serve' 2>/dev/null
+kill $(lsof -ti :{TTS_PORT}) 2>/dev/null
+rm -rf {shlex.quote(TTS_DIR)}
+rm -rf {shlex.quote(os.path.expanduser("~/.local/kobzarai"))}
+rm -f {shlex.quote(os.path.expanduser("~/.ollama/start-ollama.sh"))}
+rm -f /tmp/kobzarai.log
+rm -rf {rm_apps}
+osascript -e 'display notification "Застосунок, TTS-сервер і лаунчер Ollama видалено. Дякую, що користувались." with title "KobzarAI видалено"'
+rm -f "$0"
+"""
+        try:
+            sp = "/tmp/kobzarai_uninstall.sh"
+            with open(sp, "w") as f: f.write(script)
+            os.chmod(sp, 0o755)
+            subprocess.Popen(["bash", sp], start_new_session=True)
+        except Exception:
+            rumps.alert(title="Не вдалося запустити видалення",
+                        message="Спробуй ще раз або видали вручну: "
+                                "/Applications/KobzarAI.app та ~/.local/kobzarai")
+            return
+        self.panel.quit_all(None)
+
+    def windowDidBecomeKey_(self, n): self._reaccent_segments()
+    def windowDidResignKey_(self, n): self._reaccent_segments()
+    def windowDidResize_(self, n):
+        try: self._scroll._layout_mask()
+        except Exception: pass
+
+    @objc.python_method
+    def _reaccent_segments(self):
+        for nm in ("seg", "tts_mode"):
+            s = getattr(self, nm, None)
+            if s is not None and hasattr(s, "setNeedsDisplay_"):
+                try: s.setNeedsDisplay_(True)
+                except Exception: pass
+
     def transpChanged_(self, sender):
-        cfg = load_cfg(); cfg["transp"] = int(sender.floatValue()); save_cfg(cfg)
+        iv = int(sender.floatValue())
+        cfg = load_cfg(); cfg["transp"] = iv; save_cfg(cfg)
+        tv = getattr(self, "transp_val", None)
+        if tv is not None:
+            try: tv.setStringValue_("%d%%" % iv)
+            except Exception: pass
         if getattr(self, "_glass", None) is not None:
             self._apply_transp(self._glass)
 
@@ -1813,20 +3318,61 @@ class SettingsWindow(NSObject):
     def _apply_transp(self, glass):
         """Прозорість «скла»: непрозора підкладка поверх блюру, alpha = 1−прозорість.
         0 = суцільний фон (як System Settings), 100 = максимум скла."""
-        frac = max(0, min(100, int(load_cfg().get("transp", 35)))) / 100.0
+        raw = max(0, min(100, int(load_cfg().get("transp", 35)))) / 100.0
+        # справжнє скло вже прозоре — крива м'якша, повзунок керує ТІЛЬКИ молочним fill.
+        frac = raw ** 0.55
+        host = getattr(self, "_host", glass)
         fill = getattr(self, "_transp_fill", None)
         if fill is None:
-            fill = NSView.alloc().initWithFrame_(glass.bounds())
+            fill = NSView.alloc().initWithFrame_(host.bounds())
             fill.setWantsLayer_(True)
             fill.setAutoresizingMask_(18)
-            glass.addSubview_positioned_relativeTo_(fill, -1, None)  # NSWindowBelow — під контентом
+            host.addSubview_positioned_relativeTo_(fill, -1, None)  # NSWindowBelow — під контентом
             self._transp_fill = fill
-        try:
-            c = NSColor.windowBackgroundColor().colorUsingColorSpace_(NSColorSpace.sRGBColorSpace())
-            fill.layer().setBackgroundColor_(
-                NSColor.colorWithRed_green_blue_alpha_(
-                    c.redComponent(), c.greenComponent(), c.blueComponent(), 1.0 - frac).CGColor())
-        except Exception: pass
+        # windowBackgroundColor — динамічний; його треба резолвити САМЕ під поточною темою
+        # вікна, інакше після зміни appearance дістанемо колір старої теми (CALayer його
+        # заморожує). performAsCurrentDrawingAppearance гарантує резолв під новою темою.
+        def paint():
+            try:
+                c = NSColor.windowBackgroundColor().colorUsingColorSpace_(NSColorSpace.sRGBColorSpace())
+                # floor 0.15: навіть на «100% скла» лишається мінімум молока —
+                # інакше secondary-текст тонув у шпалерах (нечитабельний UI)
+                fill.layer().setBackgroundColor_(
+                    NSColor.colorWithRed_green_blue_alpha_(
+                        c.redComponent(), c.greenComponent(), c.blueComponent(),
+                        max(0.15, 1.0 - frac)).CGColor())
+            except Exception: pass
+        def paint_all():
+            paint()
+            # справжнє скло: легкий tint для читабельності тексту на максимумі прозорості
+            # (на повному склі без молока — трохи молочної плівки, як у системних віджетів).
+            if _HAS_GLASS and hasattr(glass, "setTintColor_"):
+                try:
+                    is_dark = "Dark" in str(glass.effectiveAppearance().name())
+                    base = 0.0 if is_dark else 1.0
+                    a = 0.08 + 0.10 * frac      # більше скла → більше молока, щоб текст не тонув
+                    glass.setTintColor_(NSColor.colorWithWhite_alpha_(base, a))
+                except Exception: pass
+            else:
+                try:
+                    if   frac >= 0.60: mat = NSVisualEffectMaterialHUDWindow
+                    elif frac >= 0.30: mat = NSVisualEffectMaterialUnderWindowBackground
+                    else:              mat = NSVisualEffectMaterialWindowBackground
+                    glass.setMaterial_(mat)
+                except Exception: pass
+            tint = self._card_tint()      # картки — під поточну тему
+            for c in self._cards:
+                try: c.setFillColor_(tint)
+                except Exception: pass
+            ktint = self._keycap_tint()
+            for c in getattr(self, "_keycaps", []):
+                try: c.setFillColor_(ktint)
+                except Exception: pass
+        ap = glass.effectiveAppearance()
+        if hasattr(ap, "performAsCurrentDrawingAppearance_"):
+            ap.performAsCurrentDrawingAppearance_(paint_all)
+        else:
+            paint_all()
 
     def browseModelsDir_(self, sender):
         p = NSOpenPanel.openPanel()
@@ -1835,6 +3381,116 @@ class SettingsWindow(NSObject):
         if p.runModal() == 1:
             url = p.URLs()[0]
             self.models_field.setStringValue_(str(url.path()))
+
+    @objc.python_method
+    def _kb_status_text(self):
+        if self.kb_index:
+            try:
+                s = self._kb_get().stats()
+                return "готовий індекс · %d фрагментів (без переіндексації)" % s.get("chunks", 0)
+            except Exception:
+                return "готовий індекс обрано"
+        if not self.kb_folder:
+            return "джерело не обрано"
+        try:
+            kb = self._kb_get()
+            if kb is None:
+                return "готово до індексації"
+            s = kb.stats()
+            if not s.get("chunks"):
+                return "тека обрана — натисни «Проіндексувати»"
+            when = ""
+            if s.get("updated"):
+                when = " · " + time.strftime("%d.%m %H:%M", time.localtime(s["updated"]))
+            return "%d файлів · %d фрагментів%s" % (s["files"], s["chunks"], when)
+        except Exception:
+            return "готово до індексації"
+
+    @objc.python_method
+    def _kb_sync_controls(self):
+        """Обрано готовий індекс → поле теки/папка/«Проіндексувати» неактивні
+        (нема що індексувати — читаємо готове)."""
+        own = not bool(self.kb_index)
+        for w in (getattr(self, "kb_field", None), getattr(self, "kb_browse_btn", None),
+                  getattr(self, "kb_index_btn", None)):
+            if w is not None:
+                try: w.setEnabled_(own)
+                except Exception: pass
+
+    def kbIndexChanged_(self, sender):
+        i = int(sender.indexOfSelectedItem())
+        paths = getattr(self, "_kb_index_paths", [""])
+        self.kb_index = paths[i] if 0 <= i < len(paths) else ""
+        self._kb = None                                # джерело змінилось → перепідняти
+        cfg = load_cfg(); cfg["kb_index"] = self.kb_index; save_cfg(cfg)
+        self.kb_status.setStringValue_(self._kb_status_text())
+        self._kb_sync_controls()
+        self._sync_kb()
+
+    def browseKbDir_(self, sender):
+        p = NSOpenPanel.openPanel()
+        p.setCanChooseDirectories_(True); p.setCanChooseFiles_(False)
+        p.setAllowsMultipleSelection_(False); p.setPrompt_("Вибрати")
+        if p.runModal() == 1:
+            path = str(p.URLs()[0].path())
+            self.kb_folder = path
+            self.kb_index = ""                         # перехід на власну теку → зняти готовий
+            self._kb = None                            # тека змінилась → перепідняти KB
+            cfg = load_cfg(); cfg["kb_folder"] = path; cfg["kb_index"] = ""; save_cfg(cfg)
+            self.kb_field.setStringValue_(path)
+            if getattr(self, "kb_index_pop", None) is not None:
+                self.kb_index_pop.selectItemAtIndex_(0)
+            self.kb_status.setStringValue_(self._kb_status_text())
+            self._sync_kb()
+
+    def reindexKb_(self, sender):
+        path = str(self.kb_field.stringValue()).strip()
+        if path and (path != self.kb_folder or self.kb_index):
+            self.kb_folder = path; self.kb_index = ""; self._kb = None
+            cfg = load_cfg(); cfg["kb_folder"] = path; cfg["kb_index"] = ""; save_cfg(cfg)
+            if getattr(self, "kb_index_pop", None) is not None:
+                self.kb_index_pop.selectItemAtIndex_(0)
+        if not self.kb_folder:
+            self.kb_status.setStringValue_("спершу обери теку")
+            return
+        self.kb_status.setStringValue_("індексація… (перший раз ~хвилина)")
+        def done(stats, err):
+            if err:
+                self.kb_status.setStringValue_("помилка: " + err[:60])
+            else:
+                self.kb_status.setStringValue_(self._kb_status_text())
+            self._sync_kb()
+        self._kb_reindex(done)
+
+    def browseChatsDir_(self, sender):
+        p = NSOpenPanel.openPanel()
+        p.setCanChooseDirectories_(True); p.setCanChooseFiles_(False)
+        p.setAllowsMultipleSelection_(False); p.setPrompt_("Вибрати")
+        if p.runModal() == 1:
+            path = str(p.URLs()[0].path())
+            cfg = load_cfg(); cfg["chats_dir"] = path or None; save_cfg(cfg)
+            self.chats_field.setStringValue_(chats_dir())
+            self.sessions = load_chats() or [
+                {"title": "Чат 1", "history": [], "ts": time.time(),
+                 "id": str(int(time.time() * 1000))}]
+            self.cur = 0; self._reload_hist(); self._render_session()
+
+    def revealChatsDir_(self, sender):
+        d = chats_dir()
+        try: os.makedirs(d, exist_ok=True)
+        except Exception: pass
+        subprocess.Popen(["open", d])
+
+    def applyChatsDir_(self, sender):
+        path = str(self.chats_field.stringValue()).strip()
+        cfg = load_cfg(); cfg["chats_dir"] = path or None; save_cfg(cfg)
+        self.chats_field.setStringValue_(chats_dir())
+        self.sessions = load_chats() or [
+            {"title": "Чат 1", "history": [], "ts": time.time(),
+             "id": str(int(time.time() * 1000))}]
+        self.cur = 0
+        try: self._reload_hist(); self._render_session()
+        except Exception: pass
 
     def recordHK_(self, sender):
         self.panel.hotkeys.recording = HK_LABELS[sender.tag()][0]
@@ -1860,19 +3516,59 @@ class SettingsWindow(NSObject):
         name = str(self.pull_field.stringValue()).strip()
         if name: self.panel.start_pull(name)
 
-    # ── бібліотека моделей (Ollama / HuggingFace) ──
-    def numberOfRowsInTableView_(self, tv):
-        return len(getattr(self, "lib_filtered", []))
+    def clearPull_(self, sender):
+        self.pull_field.setStringValue_("")
+        self._update_pull_btn()
+        try: self.win.makeFirstResponder_(self.pull_field)
+        except Exception: pass
 
-    def tableView_objectValueForTableColumn_row_(self, tv, col, row):
+    def cancelPull_(self, sender):
+        self.panel.cancel_pull()
+
+    # ── бібліотека моделей (Ollama / HuggingFace) ──
+    # ── ЄДИНИЙ делегат на 2 таблиці (бібліотека + чати) → диспетч по tv. ──
+    # Реалізація viewForTableColumn робить ОБИДВІ таблиці view-based, тож
+    # бібліотеку теж малюємо комірками-view (не cell-based objectValue).
+    def numberOfRowsInTableView_(self, tv):
+        if tv is getattr(self, "lib_table", None):
+            return len(getattr(self, "lib_filtered", []))
+        return len(self.sessions)
+
+    @objc.python_method
+    def _lib_cell(self, col, row):
         rows = getattr(self, "lib_filtered", [])
         if not (0 <= row < len(rows)):
-            return ""
+            return None
         r = rows[row]
-        if str(col.identifier()) == "size":
-            return self._size_for(r)
-        dl = r.get("dl")
-        return f"{r['id']}    ↓{short_num(dl)}" if dl else r["id"]
+        is_size = str(col.identifier()) == "size"
+        f = NSTextField.alloc().init()
+        f.setBezeled_(False); f.setDrawsBackground_(False)
+        f.setEditable_(False); f.setSelectable_(False)
+        f.cell().setLineBreakMode_(4)               # truncate tail
+        f.setTranslatesAutoresizingMaskIntoConstraints_(False)
+        if is_size:
+            f.setAlignment_(2)                       # праворуч
+            f.setFont_(NSFont.systemFontOfSize_(11.0))
+            f.setTextColor_(NSColor.secondaryLabelColor())
+            f.setStringValue_(self._size_for(r))
+        else:
+            f.setFont_(NSFont.systemFontOfSize_(12.0))
+            f.setTextColor_(NSColor.labelColor())
+            dl = r.get("dl")
+            f.setStringValue_(f"{r['id']}    ↓{short_num(dl)}" if dl else r["id"])
+        # контейнер на всю висоту рядка → поле центрується по вертикалі (інакше
+        # h17-поле сиділо вгорі рядка 26 → «текст не відцентрований по плашці»).
+        # бічний відступ 10 → текст лягає всередину заокругленої підсвітки (інсет 4).
+        cell = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, 80, 26))
+        cell.setAutoresizingMask_(18)
+        cell.addSubview_(f)
+        padL = 0 if is_size else 10
+        padR = 10 if is_size else 0
+        NSLayoutConstraint.activateConstraints_([
+            f.leadingAnchor().constraintEqualToAnchor_constant_(cell.leadingAnchor(), padL),
+            f.trailingAnchor().constraintEqualToAnchor_constant_(cell.trailingAnchor(), -padR),
+            f.centerYAnchor().constraintEqualToAnchor_(cell.centerYAnchor())])
+        return cell
 
     @objc.python_method
     def _size_for(self, r):
@@ -1929,8 +3625,32 @@ class SettingsWindow(NSObject):
         self._apply_lib_filter()
 
     @objc.python_method
+    def _sel_lib_id(self):
+        """id моделі під поточним виділенням (щоб тримати вибір на ТІЙ САМІЙ моделі
+        крізь пересорти/reload — інакше індекс «з'їжджає» на іншу модель)."""
+        tv = self.lib_table
+        if tv is None:
+            return None
+        old = getattr(self, "lib_filtered", [])
+        r = tv.selectedRow()
+        return old[r]["id"] if 0 <= r < len(old) else None
+
+    @objc.python_method
+    def _restore_lib_sel(self, sel_id):
+        tv = self.lib_table
+        if tv is None or sel_id is None:
+            return
+        for i, r in enumerate(self.lib_filtered):
+            if r["id"] == sel_id:
+                tv.selectRowIndexes_byExtendingSelection_(
+                    NSIndexSet.indexSetWithIndex_(i), False)
+                return
+        tv.deselectAll_(None)             # модель зникла зі списку → знімаємо виділення
+
+    @objc.python_method
     def _apply_lib_filter(self):
         self._apply_lib_online_ui()
+        sel_id = self._sel_lib_id()       # запам'ятати вибір ПЕРЕД пересортом
         if not self.lib_online:           # офлайн → чистий список + заглушка, без сміття
             self.lib_filtered = []
             if self.lib_table is not None:
@@ -1953,6 +3673,7 @@ class SettingsWindow(NSObject):
         self.lib_filtered = rows
         if self.lib_table is not None:
             self.lib_table.reloadData()
+            self._restore_lib_sel(sel_id)       # повернути виділення на ту саму модель
         self._update_lib_empty()
         if sk == "size" and self.lib_online:    # підтягнути розміри всіх рядків і пересортувати
             self._kick_size_prefetch(rows)
@@ -1995,7 +3716,9 @@ class SettingsWindow(NSObject):
         if getattr(self, "lib_sort", None) == "size":
             self._apply_lib_filter()
         elif self.lib_table is not None:
+            sel_id = self._sel_lib_id()       # лише оновити розміри — вибір не губити
             self.lib_table.reloadData()
+            self._restore_lib_sel(sel_id)
 
     @objc.python_method
     def _update_lib_empty(self):
@@ -2062,7 +3785,11 @@ class SettingsWindow(NSObject):
         cur = self.sel_model
         self.model_pop.removeAllItems()
         ms = list_models()
-        self.model_pop.addItemsWithTitles_(ms or ["(моделей нема)"])
+        if ms:
+            self.model_pop.addItemsWithTitles_(ms)
+        else:                                          # порожньо ≠ «нема»: розрізняй сервіс-офф
+            self.model_pop.addItemsWithTitles_(
+                ["(Ollama не запущена)" if not ollama_up() else "(моделей нема)"])
         pick = cur if cur in ms else pick_chat_model(ms)
         if pick:
             self.model_pop.selectItemWithTitle_(pick)
@@ -2079,9 +3806,9 @@ class SettingsWindow(NSObject):
             name = loaded[0].split("  ")[0].strip()
             sz = ram_size(loaded[0])
             cur_loaded = name
-            self.loaded_lbl.setStringValue_(f"Зараз у RAM: {name}" + (f"   ·   {sz}" if sz else ""))
+            self.loaded_lbl.setStringValue_(f"{name}" + (f"  ·  {sz}" if sz else ""))
         else:
-            self.loaded_lbl.setStringValue_("Зараз у RAM: —  (RAM вільна)")
+            self.loaded_lbl.setStringValue_("—  (RAM вільна)")
         # «У RAM» горить акцентом лише коли є що вантажити (модель обрана й ще не в RAM);
         # інакше — тухне в дефолт
         if self.load_btn is not None:
@@ -2097,19 +3824,206 @@ class SettingsWindow(NSObject):
     # ---------- чат ----------
     @objc.python_method
     def _refresh_chat_header(self):
-        if self.chat_model_lbl is not None:
-            if not ollama_up():
-                self.chat_model_lbl.setStringValue_("Ollama не запущена — увімкни в меню панелі")
-            else:
-                self.chat_model_lbl.setStringValue_(
-                    f"Модель: {self.panel.current_model() or '—'}")
+        if self.chat_model_lbl is None:
+            return
+        size_lbl = getattr(self, "chat_size_lbl", None)
+        start_btn = getattr(self, "chat_start_btn", None)
+        if not ollama_up():
+            self.chat_model_lbl.setStringValue_("Ollama не запущена")
+            if size_lbl is not None: size_lbl.setStringValue_("")
+            if start_btn is not None: start_btn.setHidden_(False)
+            self._set_dot(False)
+            return
+        if start_btn is not None: start_btn.setHidden_(True)
+        m = self.panel.current_model()
+        if not m:                                       # лише ембед/vl-моделі → чат неможливий
+            self.chat_model_lbl.setStringValue_("нема чат-моделі — завантаж у вкладці «Моделі»")
+            if size_lbl is not None: size_lbl.setStringValue_("")
+            self._set_dot(False)
+            return
+        loaded = m in [r.split()[0] for r in ps_loaded()]
+        # чесний статус: зелена крапка = модель у RAM зараз; сіра = сервер живий,
+        # модель підвантажиться на першому запиті (не брешемо що вже «працює»)
+        self.chat_model_lbl.setStringValue_(m if loaded else m + "  · не в RAM")
+        if size_lbl is not None:
+            size_lbl.setStringValue_(model_size(m))
+        self._set_dot(loaded)
+
+    def chatStartOllama_(self, sender):
+        if ollama_up():
+            self._refresh_chat_header(); return
+        if not self.panel._start_ollama():
+            return                                     # причина вже показана нотифікацією/меню
+        sender.setHidden_(True)
+        self.chat_model_lbl.setStringValue_("Ollama запускається…")
+        def poll():                                    # дочекатись підйому й оновити шапку
+            for _ in range(20):
+                time.sleep(1)
+                if ollama_up(): break
+            AppHelper.callAfter(self._refresh_chat_header)
+        threading.Thread(target=poll, daemon=True).start()
+
+    @objc.python_method
+    def _set_dot(self, up):
+        d = getattr(self, "chat_dot", None)
+        if d is None or d.layer() is None: return
+        c = NSColor.systemGreenColor() if up else NSColor.tertiaryLabelColor()
+        d.layer().setBackgroundColor_(c.CGColor())
 
     @objc.python_method
     def _reload_hist(self):
-        if self.hist_pop is None: return
-        self.hist_pop.removeAllItems()
-        self.hist_pop.addItemsWithTitles_([s["title"] for s in self.sessions])
-        self.hist_pop.selectItemAtIndex_(self.cur)
+        tbl = getattr(self, "hist_tbl", None)
+        if tbl is None: return
+        tbl.reloadData()
+        if 0 <= self.cur < len(self.sessions):
+            from Foundation import NSIndexSet
+            tbl.selectRowIndexes_byExtendingSelection_(
+                NSIndexSet.indexSetWithIndex_(self.cur), False)
+
+    # ── datasource/delegate бічного списку чатів ──
+    def tableView_viewForTableColumn_row_(self, tv, col, row):
+        if tv is getattr(self, "lib_table", None):
+            return self._lib_cell(col, row)
+        # двострічкова комірка: назва (semibold) + час (як «Topics» у Cherry)
+        if not (0 <= row < len(self.sessions)): return None
+        s = self.sessions[row]
+        w = LP_SBW - 4
+        cell = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, w, 46))
+        title = NSTextField.alloc().initWithFrame_(NSMakeRect(11, 23, w - 20, 18))
+        title.setBezeled_(False); title.setDrawsBackground_(False)
+        title.setEditable_(False); title.setSelectable_(False)
+        title.setFont_(NSFont.systemFontOfSize_weight_(13.0, 0.23))
+        title.setTextColor_(NSColor.labelColor())
+        title.setStringValue_(s["title"]); title.cell().setLineBreakMode_(4)  # truncate tail
+        title.setAutoresizingMask_(2)
+        sub = NSTextField.alloc().initWithFrame_(NSMakeRect(11, 6, w - 20, 13))
+        sub.setBezeled_(False); sub.setDrawsBackground_(False)
+        sub.setEditable_(False); sub.setSelectable_(False)
+        sub.setFont_(NSFont.systemFontOfSize_(10.5))
+        sub.setTextColor_(NSColor.secondaryLabelColor())
+        sub.setStringValue_(rel_time(s.get("ts"))); sub.setAutoresizingMask_(2)
+        cell.addSubview_(title); cell.addSubview_(sub)
+        return cell
+
+    def tableView_rowViewForRow_(self, tv, row):
+        # заокруглена вставлена підсвітка (як список чатів → єдиний UI)
+        if tv is getattr(self, "lib_table", None):
+            return _LibRowView.alloc().initWithFrame_(NSMakeRect(0, 0, 400, 26))
+        return ChatRowView.alloc().initWithFrame_(NSMakeRect(0, 0, LP_SBW, 46))
+
+    def tableViewSelectionDidChange_(self, note):
+        tbl = getattr(self, "hist_tbl", None)
+        if tbl is None: return
+        r = tbl.selectedRow()
+        if 0 <= r < len(self.sessions) and r != self.cur:
+            self.cur = r; self._render_session()
+
+    # ── контекст-меню рядка чату (правий клік): перейменувати / очистити / видалити ──
+    @objc.python_method
+    def _chat_row_menu(self):
+        m = NSMenu.alloc().init()
+        for title, sel in (("Перейменувати…", "renameChat:"),
+                           ("Очистити повідомлення", "clearMsgsChat:"),
+                           (None, None),
+                           ("Видалити чат", "deleteChat:")):
+            if title is None:
+                m.addItem_(NSMenuItem.separatorItem()); continue
+            it = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(title, sel, "")
+            it.setTarget_(self); m.addItem_(it)
+        return m
+
+    @objc.python_method
+    def _menu_row(self):
+        # ціль правого кліку з нашого menuForEvent_ (без зміни активного чату);
+        # фолбек на clickedRow/selectedRow
+        r = getattr(self, "_ctx_row", -1)
+        if r is not None and r >= 0:
+            return r
+        tbl = self.hist_tbl
+        r = tbl.clickedRow()
+        return r if r >= 0 else tbl.selectedRow()
+
+    def renameChat_(self, sender):
+        r = self._menu_row()
+        if not (0 <= r < len(self.sessions)): return
+        a = NSAlert.alloc().init()
+        a.setMessageText_("Перейменувати чат")
+        a.addButtonWithTitle_("Зберегти"); a.addButtonWithTitle_("Скасувати")
+        fld = NSTextField.alloc().initWithFrame_(NSMakeRect(0, 0, 230, 24))
+        fld.setStringValue_(self.sessions[r]["title"])
+        a.setAccessoryView_(fld); a.window().setInitialFirstResponder_(fld)
+        if a.runModal() == 1000:                       # NSAlertFirstButtonReturn
+            t = str(fld.stringValue()).strip()
+            if t:
+                self.sessions[r]["title"] = t
+                delete_chat_file(self.sessions[r])         # імʼя файлу слідує за назвою (для Finder)
+                self.sessions[r].pop("_file", None)
+                save_chat(self.sessions[r]); self._reload_hist()
+
+    def clearMsgsChat_(self, sender):
+        r = self._menu_row()
+        if 0 <= r < len(self.sessions):
+            self.sessions[r]["history"] = []
+            save_chat(self.sessions[r])
+            if r == self.cur: self._render_session()
+
+    def deleteChat_(self, sender):
+        r = self._menu_row()
+        if not (0 <= r < len(self.sessions)): return
+        delete_chat_file(self.sessions[r])
+        del self.sessions[r]
+        if not self.sessions:
+            self.sessions.append({"title": "Чат 1", "history": [], "ts": time.time(),
+                                  "id": str(int(time.time() * 1000))})
+        self.cur = min(self.cur, len(self.sessions) - 1)
+        self._reload_hist(); self._render_session()
+
+    # ── міст копіювання з webview → NSPasteboard ──
+    def userContentController_didReceiveScriptMessage_(self, ucc, msg):
+        try:
+            txt = msg.body()
+            if txt is None: return
+            name = str(msg.name())
+            if name == "ui":
+                self._ui_action(txt); return
+            if name == "speak":
+                self.panel._speak(str(txt))               # озвучити цю відповідь
+            elif name == "open":                          # відкрити файл-джерело з видачі бази знань
+                p = str(txt)
+                if p and os.path.exists(p):               # лише реальний наявний шлях
+                    subprocess.Popen(["open", p], start_new_session=True)
+            elif name == "regen":
+                self._regen_last()                        # «Ще раз» — перегенерувати
+            else:                                         # copy
+                pb = NSPasteboard.generalPasteboard()
+                pb.clearContents()
+                pb.setString_forType_(str(txt), "public.utf8-plain-text")
+        except Exception:
+            pass
+
+    @objc.python_method
+    def _regen_last(self):
+        # «Ще раз»: прибрати останню відповідь AI і перегенерувати з тією ж історією.
+        if getattr(self, "_generating", False):
+            return
+        model = self.panel.current_model()
+        if not model:
+            self._js("note('нема моделі')"); return
+        if not ollama_up():
+            self._js("note('Ollama не запущена')"); return
+        sess = self.sessions[self.cur]
+        h = sess["history"]
+        if h and h[-1]["role"] == "assistant":
+            h.pop()                                       # викинути попередню відповідь
+        if not (h and h[-1]["role"] == "user"):
+            return                                        # нема запиту для регенерації
+        save_chat(sess)
+        self._render_session()                            # перемалювати без старої відповіді
+        self._js("aiStart()")
+        self.gen_cancel = threading.Event()
+        self._gen_ui(True)
+        threading.Thread(target=self._worker, args=(model, sess, self.gen_cancel),
+                         daemon=True).start()
 
     # ── міст у webview: усі виклики маршалимо на головний потік; до завантаження — у чергу ──
     @objc.python_method
@@ -2123,6 +4037,10 @@ class SettingsWindow(NSObject):
         AppHelper.callAfter(run)
 
     def webView_didFinishNavigation_(self, web, nav):
+        if web is getattr(self, "set_web", None):
+            # settings-сторінка завантажилась — тут проштовхуватимемо стан у JS (стадія 2+)
+            self._settings_ready = True
+            return
         self._web_ready = True
         q, self._js_queue = self._js_queue, []
         for s in q:
@@ -2141,6 +4059,10 @@ class SettingsWindow(NSObject):
     def _render_session(self):
         if self.web is None:
             return
+        if not (0 <= self.cur < len(self.sessions)):   # cur міг з'їхати після пересорту/видалення
+            self.cur = 0
+        if not self.sessions:
+            self._js("clearAll()"); self._js("empty()"); return
         self._js("clearAll()")
         h = self.sessions[self.cur]["history"]
         if not h:
@@ -2149,43 +4071,73 @@ class SettingsWindow(NSObject):
             fn = "addUser" if m["role"] == "user" else "addAI"
             self._js("%s(%s)" % (fn, json.dumps(m["content"])))
 
+    @objc.python_method
+    def _sid_index(self, sid):
+        """Індекс сесії за стабільним id (−1 якщо нема). Рвʼязка чату йде за id, НЕ за
+        позицією — інакше пересорт за часом (активний чат стрибає вгору) плутав cur і
+        повідомлення потрапляли в чужий чат."""
+        for i, s in enumerate(self.sessions):
+            if s.get("id") == sid:
+                return i
+        return -1
+
     def newChat_(self, sender):
-        self.sessions.append({"title": f"Чат {len(self.sessions) + 1}", "history": []})
-        self.cur = len(self.sessions) - 1
+        sid = str(int(time.time() * 1000))
+        # вставляємо ЗВЕРХУ (список — новіші вгорі), а не в кінець — інакше новий чат
+        # опинявся внизу, а cur/рендер розходились
+        self.sessions.insert(0, {"id": sid, "title": f"Чат {len(self.sessions) + 1}",
+                                 "history": [], "ts": time.time()})
+        self.cur = 0
         self._reload_hist(); self._render_session()
 
     def clearChat_(self, sender):
         # видалити поточний чат повністю (не просто очистити історію)
-        del self.sessions[self.cur]
+        if 0 <= self.cur < len(self.sessions):
+            delete_chat_file(self.sessions[self.cur])
+            del self.sessions[self.cur]
         if not self.sessions:
-            self.sessions.append({"title": "Чат 1", "history": []})
+            self.sessions.append({"title": "Чат 1", "history": [], "ts": time.time(),
+                                  "id": str(int(time.time() * 1000))})
         self.cur = min(self.cur, len(self.sessions) - 1)
         self._reload_hist(); self._render_session()
 
-    def histChanged_(self, sender):
-        i = self.hist_pop.indexOfSelectedItem()
-        if 0 <= i < len(self.sessions):
-            self.cur = i; self._render_session()
-
     def autospeakToggled_(self, sender):
-        self.autospeak_on = bool(sender.state())
+        # динамік-кнопка: клік перемикає автоозвучку, колір віддзеркалює стан
+        self.autospeak_on = not self.autospeak_on
+        self._sync_spk()
 
-    # кнопки в чаті керують ГЛОБАЛЬНИМ TTS (як хоткеї, але без accessibility)
+    # пауза/стоп озвучки лишилися на хоткеях і в меню-барі (службовий рядок прибрано)
     def pauseSpeechBtn_(self, sender):
         self.panel.pause_speech(None)
 
     def stopSpeechBtn_(self, sender):
         self.panel.stop_speech(None)
 
+    def sendOrStop_(self, sender):
+        # одна кнопка: надсилання, а під час генерації — зупинка (морф ↑↔⏹)
+        if getattr(self, "_generating", False):
+            self.stopGen_(sender)
+        else:
+            self.sendChat_(sender)
+
     def stopGen_(self, sender):
         ev = self.gen_cancel
         if ev is not None:
             ev.set()
 
-    def tokenChanged_(self, sender):
-        try: n = int(str(sender.titleOfSelectedItem()))
-        except Exception: n = 2048
-        cfg = load_cfg(); cfg["num_predict"] = n; save_cfg(cfg)
+    def tokStep_(self, sender):
+        i = max(0, min(len(TOKEN_OPTS) - 1, self.tok_idx + int(sender.tag())))
+        if i == self.tok_idx: return
+        self.tok_idx = i
+        self.tok_num.setStringValue_(TOKEN_OPTS[i])
+        cfg = load_cfg(); cfg["num_predict"] = int(TOKEN_OPTS[i]); save_cfg(cfg)
+
+    def ctxStep_(self, sender):
+        i = max(0, min(len(CTX_OPTS) - 1, self.ctx_idx + int(sender.tag())))
+        if i == self.ctx_idx: return
+        self.ctx_idx = i
+        self.ctx_num.setStringValue_(CTX_OPTS[i])
+        cfg = load_cfg(); cfg["num_ctx"] = int(CTX_OPTS[i]); save_cfg(cfg)
 
     def textDidChange_(self, note):
         # ховати плейсхолдер коли є текст
@@ -2206,6 +4158,8 @@ class SettingsWindow(NSObject):
         try:
             CW = holder.bounds().size.width
             M = LP_M
+            x0 = M + LP_SBW + LP_SBG      # та сама геометрія, що в _build_chat
+            cw = CW - x0 - M
             lm = tv.layoutManager(); tc = tv.textContainer()
             lm.ensureLayoutForTextContainer_(tc)
             used = lm.usedRectForTextContainer_(tc).size.height
@@ -2214,17 +4168,18 @@ class SettingsWindow(NSObject):
             in_h = max(26.0, min(content, 26.0 + 4 * line))   # 1..~5 рядків
             at_max = in_h >= 26.0 + 4 * line - 0.5
             pill_h = in_h + 14.0
-            pill_y = 42.0
+            pill_y = 14.0
             send_d = 30
             sx = CW - M - 9 - send_d
-            stx = sx - 4 - 26
-            in_x = M + 16
-            in_w = stx - 10 - in_x
-            pill.setFrame_(NSMakeRect(M, pill_y, CW - 2 * M, pill_h))
+            spk_d = 28
+            spk_x = sx - 6 - spk_d
+            in_x = x0 + 16
+            in_w = spk_x - 10 - in_x
+            pill.setFrame_(NSMakeRect(x0, pill_y, cw, pill_h))
             if self.send_btn is not None:
                 self.send_btn.setFrame_(NSMakeRect(sx, pill_y + (pill_h - send_d) / 2.0, send_d, send_d))
-            if getattr(self, "chat_stop", None) is not None:
-                self.chat_stop.setFrame_(NSMakeRect(stx, pill_y + (pill_h - 26) / 2.0, 26, 26))
+            if getattr(self, "autospeak", None) is not None:
+                self.autospeak.setFrame_(NSMakeRect(spk_x, pill_y + (pill_h - spk_d) / 2.0, spk_d, spk_d))
             sc.setFrame_(NSMakeRect(in_x, pill_y + (pill_h - in_h) / 2.0, in_w, in_h))
             sc.setHasVerticalScroller_(at_max)
             if getattr(self, "chat_ph", None) is not None:
@@ -2233,7 +4188,7 @@ class SettingsWindow(NSObject):
                 f = self.web.frame()
                 top = f.origin.y + f.size.height
                 tr_bottom = pill_y + pill_h + 12
-                self.web.setFrame_(NSMakeRect(M, tr_bottom, CW - 2 * M, top - tr_bottom))
+                self.web.setFrame_(NSMakeRect(x0, tr_bottom, cw, top - tr_bottom))
         except Exception:
             pass
 
@@ -2252,31 +4207,102 @@ class SettingsWindow(NSObject):
         txt = str(self.chat_input.string()).strip()
         if not txt: return
         model = self.panel.current_model()
-        if not model:
+        # Чат-моделі нема, але База знань увімкнена → чистий семантичний режим:
+        # запит → ембед (bge-m3) → топ-фрагменти як відповідь, LLM не потрібна
+        kb_only = (not model) and self.kb_on and bool(self.kb_index or self.kb_folder)
+        if not model and not kb_only:
             self._js("note('нема моделі')"); return
         if not ollama_up():
             self._js("note('Ollama не запущена')"); return
+        if self.autospeak_on and tts_mode() == "realtime" and not self._ram_warned:
+            warn = realtime_ram_risk()
+            if warn:
+                self._js("note(%s)" % json.dumps(warn))
+                self._ram_warned = True
         self.chat_input.setString_("")
         self._grow_chat_input()          # скинути висоту пігулки після надсилання
         if getattr(self, "chat_ph", None) is not None:
             self.chat_ph.setHidden_(False)
         sess = self.sessions[self.cur]
+        sess.setdefault("id", str(int(time.time() * 1000)))
+        sid = sess["id"]
+        sess["ts"] = time.time()                       # час останньої активності → у список
         if not sess["history"]:
             sess["title"] = (txt[:20] + "…") if len(txt) > 20 else txt
-            self._reload_hist()
+        # активний чат піднімається вгору; cur тримаємо за id (не за старою позицією)
+        self.sessions.sort(key=lambda s: s.get("ts", 0), reverse=True)
+        self.cur = self._sid_index(sid)
+        self._reload_hist()
         self._js("addUser(%s)" % json.dumps(txt))
         self._js("aiStart()")
         sess["history"].append({"role": "user", "content": txt})
+        save_chat(sess)                                # фіксуємо на диск (чат вже існує)
         self.gen_cancel = threading.Event()
-        threading.Thread(target=self._worker, args=(model, sess, self.gen_cancel), daemon=True).start()
+        self._gen_ui(True)                              # send → червоний стоп (⏹) на час генерації
+        if kb_only:
+            threading.Thread(target=self._kb_only_worker, args=(sess,), daemon=True).start()
+        else:
+            threading.Thread(target=self._worker, args=(model, sess, self.gen_cancel), daemon=True).start()
+
+    @objc.python_method
+    def _kb_only_worker(self, sess):
+        """Чистий семантичний пошук без LLM (чат-моделі нема, kb_on=True):
+        останній запит → ембед bge-m3 → топ-фрагменти прямо у відповідь."""
+        try:
+            last_user = next((m["content"] for m in reversed(sess["history"])
+                              if m.get("role") == "user"), "")
+            kb = self._kb_get()
+            if kb is None:
+                self._js("aiEnd()"); self._js("note('база знань недоступна')"); return
+            hits = kb.search(last_user, k=6)
+            if not hits:
+                full = "Нічого не знайшов у базі знань за цим запитом."
+                self._js("aiAppend(%s)" % json.dumps(full))
+            else:
+                cards, parts = [], []
+                for h in hits:
+                    path = h.get("path", "") or ""
+                    tag = os.path.basename(path) or "джерело"
+                    snip = (h.get("text") or "").strip()
+                    if len(snip) > 700:
+                        snip = snip[:700] + "…"
+                    # клікабельним робимо лише реальний наявний файл (архіви/memory = .md/.jsonl на диску)
+                    clk = path if (os.path.sep in path and os.path.exists(path)) else ""
+                    cards.append({"tag": tag, "text": snip, "path": clk})
+                    parts.append("%s\n%s" % (tag, snip))
+                full = "\n\n———\n\n".join(parts)
+                self._js("aiHits(%s)" % json.dumps(cards))
+            sess["history"].append({"role": "assistant", "content": full})
+            if sess in self.sessions: save_chat(sess)   # видалений під час пошуку — не воскрешати
+            self._js("aiEnd()")
+        except Exception as e:
+            self._js("aiEnd()")
+            self._js("note(%s)" % json.dumps("пошук: " + str(e)[:80]))
+        finally:
+            AppHelper.callAfter(self._gen_ui, False)    # будь-який вихід → send назад у ↑
 
     @objc.python_method
     def _worker(self, model, sess, cancel=None):
         try:
-            np = int(load_cfg().get("num_predict", 2048))
-            payload = json.dumps({"model": model, "messages": sess["history"], "stream": True,
+            _cfg = load_cfg()
+            np = int(_cfg.get("num_predict", 2048))
+            nctx = int(_cfg.get("num_ctx", 4096))
+            messages = sess["history"]
+            # База знань: ретрів по останньому запиту → системний контекст спереду.
+            # Не мутуємо збережену історію — лише те, що йде в модель цього разу.
+            if self.kb_on:
+                last_user = next((m["content"] for m in reversed(sess["history"])
+                                  if m.get("role") == "user"), "")
+                ctx = self._kb_retrieve(last_user) if last_user else ""
+                if ctx:
+                    preamble = ("Ти відповідаєш, спираючись на наведені фрагменти з бази "
+                                "знань користувача. Якщо відповіді в них немає — так і скажи, "
+                                "не вигадуй.\n\n=== БАЗА ЗНАНЬ ===\n" + ctx)
+                    messages = [{"role": "system", "content": preamble}] + list(sess["history"])
+            payload = json.dumps({"model": model, "messages": messages, "stream": True,
                                   "think": False,
-                                  "options": {"num_predict": np, "temperature": 0.6}}).encode()
+                                  "options": {"num_predict": np, "num_ctx": nctx,
+                                              "temperature": 0.6}}).encode()
             req = urllib.request.Request(f"http://{OLLAMA_HOST}/api/chat", payload,
                                          {"Content-Type": "application/json"})
             acc = []; thought = False; stopped = False
@@ -2311,7 +4337,9 @@ class SettingsWindow(NSObject):
                 if tail and not stopped: self.panel._live_feed(live_gen, tail)
                 self.panel._live_end(live_gen)
             if stopped:
-                if full: sess["history"].append({"role": "assistant", "content": full})
+                if full:
+                    sess["history"].append({"role": "assistant", "content": full})
+                    if sess in self.sessions: save_chat(sess)   # видалений під час генерації — не воскрешати
                 self._js("aiEnd()")
                 self._js("note('зупинено')")
                 return
@@ -2322,12 +4350,20 @@ class SettingsWindow(NSObject):
                 self._js("aiEnd()")
                 return
             sess["history"].append({"role": "assistant", "content": full})
+            if sess in self.sessions: save_chat(sess)   # видалений під час генерації — не воскрешати
             self._js("aiEnd()")
             if self.autospeak_on and not realtime:     # base/stream — озвучити по завершенні
                 AppHelper.callAfter(lambda: self.panel._speak(full))
         except Exception as e:
+            # закрити realtime-чергу і тут — інакше synth_loop висить на q.get вічно,
+            # стан застрягає у «synth», а пауза крутить _pause_pending у порожнечу
+            try:
+                if realtime: self.panel._live_end(live_gen)
+            except Exception: pass
             self._js("aiEnd()")
             self._js("note(%s)" % json.dumps("помилка: " + str(e)[:80]))
+        finally:
+            AppHelper.callAfter(self._gen_ui, False)    # будь-який вихід → send назад у ↑
 
     @objc.python_method
     def _append(self, s, bold=False, color=None):
@@ -2419,33 +4455,53 @@ class Panel(rumps.App):
         except Exception: self.speed = 1.0
         try: self.pause = max(0.0, min(0.6, float(cfg.get("pause", 0.15))))
         except Exception: self.pause = 0.15
+        try: self.volume = max(0.0, min(1.0, float(cfg.get("volume", 0.85))))
+        except Exception: self.volume = 0.85
+        self.out_device = cfg.get("out_device") or None      # UID пристрою виводу; None=системний
         self._snd = None
         self._speak_gen = 0
         self._state = "idle"
         self._pause_pending = False   # пауза, натиснута під час синтезу → застосувати на старті відтворення
+        self._tts_active = 0          # >0 поки конвеєр озвучення живий → health-таймер не чіпає _state/_snd
         self._tts_last_use = time.time()   # коли востаннє синтезували → для авто-вивантаження по простою
         self._live = None
         self._live_buf = ""
         self._live_nflush = 0
         self._tts_starting = False
+        self._tts_was_up = False        # стан TTS попереднього тіку (детект краху)
+        self._tts_miss = 0              # поспіль промахів /health (дебаунс хибного краху)
+        self._tts_unloaded = False      # True = НАВМИСНО вивантажений по простою (не крах)
+        self._tts_logpath = os.path.expanduser("~/.local/kobzarai/logs/tts.log")
+        self._tts_restart_at = 0.0      # анти-флуд: не рестартувати частіше, ніж раз/15с
+        self._oll_was_up = None         # стан Ollama попереднього тіку (детект самопадіння)
         self._settings = None
         self._chat = None
         self.menu = [
             "mem_line",
             rumps.MenuItem("Модель у RAM:"), "loaded_line", None,
-            rumps.MenuItem("— Озвучення —"),
+            "hdr_voice",
             "speak_sel", "speak_clip", "tts_pause", "tts_stop", None,
-            rumps.MenuItem("— Сервіси —"),
-            "ollama_toggle", "unload_models", "tts_toggle", None,
+            "hdr_services",
+            "ollama_toggle", "ollama_reason", "unload_models", "tts_toggle", None,
             "chat_open", "settings", None,
             "quit",
         ]
-        self.menu["unload_models"].title = "↳ Вивантажити LLM з RAM"
+        # Постійний підпис-причина під «Запустити Ollama»: без callback → завжди сірий
+        # (неклікабельний), сховано доти, доки причина не настане (керується у refresh).
+        self.menu["ollama_reason"].title = ""
+        self.menu["ollama_reason"]._menuitem.setHidden_(True)
+        self._sym_cache = {}  # кеш SF Symbol-іконок меню (template, під колір тексту меню)
+        # секційні заголовки — нативний стиль: жирний дрібний напис вторинним кольором,
+        # без callback (сірий/неклікабельний). Без ASCII-рамки «— … —».
+        self._menu_header(self.menu["hdr_voice"], "Озвучення")
+        self._menu_header(self.menu["hdr_services"], "Сервіси")
+        self.menu["unload_models"].title = "Вивантажити LLM з RAM"
+        self._set_menu_sym(self.menu["unload_models"], "arrow.down.circle")
         self.menu["speak_clip"].title = "Озвучити буфер обміну"
         self.menu["speak_sel"].title = "Озвучити виділене"
         self.menu["tts_pause"].title = "Пауза / продовжити"
         self.menu["tts_stop"].title = "Стоп озвучку"
-        self.menu["chat_open"].title = "Міні-чат…"
+        self.menu["chat_open"].title = "Чат…"
         self.menu["settings"].title = "Налаштування…"
         self.menu["quit"].title = "Вийти"
         self.menu["ollama_toggle"].set_callback(self.toggle_ollama)
@@ -2460,13 +4516,14 @@ class Panel(rumps.App):
         self.menu["quit"].set_callback(self.quit_all)
         self.hotkeys = Hotkeys(self); self.hotkeys.start()
         self.timer = rumps.Timer(self.refresh, 1); self.timer.start()
+        self._log("APP LAUNCH")
         self._apply_autostart(cfg)
 
     def _apply_autostart(self, cfg):
         # Лише за явним opt-in у Налаштуваннях; запуск при ВІДКРИТТІ панелі, НЕ системний демон.
         try:
             if cfg.get("autostart_ollama") and not ollama_up():
-                subprocess.Popen(["bash", START_OLLAMA])
+                self._start_ollama()   # без диска тихо поверне False; причину видно в меню
             if cfg.get("autostart_tts") and not tts_up():
                 self._start_tts_server()
         except Exception:
@@ -2484,9 +4541,14 @@ class Panel(rumps.App):
             rumps.notification("Ollama", "Спершу запусти Ollama", ""); return
         def run():
             try:
+                # ембед-моделі (bge-m3 тощо) не вміють generate → гріємо через /api/embed
+                if is_embed_model(name):
+                    ep, body = "embed", {"model": name, "input": " ", "keep_alive": "30m"}
+                else:
+                    ep, body = "generate", {"model": name, "prompt": "", "keep_alive": "30m"}
                 urllib.request.urlopen(urllib.request.Request(
-                    f"http://{OLLAMA_HOST}/api/generate",
-                    json.dumps({"model": name, "prompt": "", "keep_alive": "30m"}).encode(),
+                    f"http://{OLLAMA_HOST}/api/{ep}",
+                    json.dumps(body).encode(),
                     {"Content-Type": "application/json"}), timeout=120).read()
             except Exception: pass
             AppHelper.callAfter(self._refresh_settings_models)
@@ -2515,7 +4577,11 @@ class Panel(rumps.App):
         if not name: return
         if not ollama_up():
             rumps.notification("Ollama", "Спершу запусти Ollama", ""); return
+        self._pull_cancel.clear()
         threading.Thread(target=self._do_pull, args=(name,), daemon=True).start()
+
+    def cancel_pull(self):
+        self._pull_cancel.set()
 
     def _do_pull(self, name):
         short = name.split("/")[-1].split(":")[0][:40]   # коротка назва для табла
@@ -2529,6 +4595,8 @@ class Panel(rumps.App):
                     s.pull_bar.setHidden_(True)
                 else:
                     s.pull_bar.setHidden_(False); s.pull_bar.setDoubleValue_(float(pct))
+                if getattr(s, "pull_cancel_btn", None) is not None:
+                    s.pull_cancel_btn.setHidden_(pct is None)
             AppHelper.callAfter(go)
         status(f"Завантаження {short}…"); bar(0)
         try:
@@ -2538,6 +4606,8 @@ class Panel(rumps.App):
             last = -100
             with urllib.request.urlopen(req, timeout=7200) as resp:
                 for line in resp:
+                    if self._pull_cancel.is_set():
+                        status("Скасовано"); bar(None); return
                     if not line.strip(): continue
                     d = json.loads(line)
                     if d.get("error"):
@@ -2566,12 +4636,45 @@ class Panel(rumps.App):
 
     def current_model(self):
         m = self._settings.sel_model if self._settings is not None else None
+        if m and is_embed_model(m):
+            m = None    # ембед (bge-m3) вибирають у «Моделі» для RAM-прогріву — в чат не пускати (/api/chat → 400)
         return m or pick_chat_model(list_models())
 
     def _update_activation(self):
         vis = ((self._settings is not None and self._settings.is_open)
                or (self._chat is not None and self._chat.is_open))
         try: NSApp.setActivationPolicy_(0 if vis else 1)  # Dock коли є вікно, інакше трей
+        except Exception: pass
+
+    def _menu_header(self, item, text):
+        """Секційний заголовок меню: жирний дрібний напис вторинним кольором."""
+        try:
+            from AppKit import NSAttributedString, NSForegroundColorAttributeName, \
+                NSFontAttributeName
+            ats = NSAttributedString.alloc().initWithString_attributes_(
+                text, {NSFontAttributeName: NSFont.boldSystemFontOfSize_(11.0),
+                       NSForegroundColorAttributeName: NSColor.secondaryLabelColor()})
+            item._menuitem.setAttributedTitle_(ats)
+        except Exception:
+            item.title = text
+
+    def _menu_img(self, name, point=13.0):
+        """Кешований SF Symbol для пункту меню (template → під колір тексту меню)."""
+        img = self._sym_cache.get(name)
+        if img is None:
+            img = NSImage.imageWithSystemSymbolName_accessibilityDescription_(name, None)
+            if img is not None:
+                try:
+                    cfg = NSImageSymbolConfiguration.configurationWithPointSize_weight_(point, 5)
+                    img = img.imageWithSymbolConfiguration_(cfg) or img
+                except Exception:
+                    pass
+                img.setTemplate_(True)
+            self._sym_cache[name] = img
+        return img
+
+    def _set_menu_sym(self, item, name):
+        try: item._menuitem.setImage_(self._menu_img(name))
         except Exception: pass
 
     def _set_icon(self, up, tts):
@@ -2597,16 +4700,75 @@ class Panel(rumps.App):
 
     def refresh(self, _):
         up = ollama_up(); free, swap = mem(); tts = tts_up()
-        if self._tts_starting and tts: self._tts_starting = False
+        # детект самопадіння/підняття Ollama (юзер: «лама сама випала, чому?»)
+        if self._oll_was_up is not None and up != self._oll_was_up:
+            self._log("Ollama " + ("UP" if up else "DOWN (впала сама)"))
+        self._oll_was_up = up
+        if self._tts_starting and tts:
+            self._tts_starting = False; self._tts_unloaded = False
+        # WATCHDOG (бег-сейф): сервер БУВ живий, а тепер впав, і це НЕ навмисне
+        # вивантаження по простою й НЕ розігрів → це КРАХ. Логуємо причину (хвіст
+        # tts.log) і, якщо autostart_tts увімкнено, тихо піднімаємо назад (не частіше
+        # 1×/15с, щоб не зациклитись на OOM-флапі).
+        # Дебаунс: один промах /health НЕ є крахом. Під час активної озвучки
+        # (synth/playing/paused) single-Flask зайнятий і health законно лагає під
+        # swap → промахи там ІГНОРУЄМО зовсім, інакше watchdog піднімав 2-й сервер
+        # і ось це й валило памʼять. Крах визнаємо лише як ≥3 промахи поспіль у
+        # стані спокою.
+        if not tts:
+            self._tts_miss += 1
+        else:
+            self._tts_miss = 0
+        busy = self._state in ("synth", "playing", "paused")
+        if (self._tts_was_up and not tts and not self._tts_starting
+                and not self._tts_unloaded and not busy and self._tts_miss >= 3):
+            crash_t = time.strftime('%Y-%m-%d %H:%M:%S')
+            self._tts_log(f"CRASH detected at {crash_t} ({self._tts_miss}× /health miss; "
+                          f"not idle-unload, not synth). free RAM {free}% swap {swap}M")
+            now = time.time()
+            if (load_cfg().get("autostart_tts") and now - self._tts_restart_at > 15):
+                self._tts_restart_at = now
+                self._tts_log("WATCHDOG: autostart_tts on → restarting server.")
+                self._start_tts_server()
         # авто-вивантаження TTS з RAM по простою (лише коли не озвучуємо)
         idle_m = tts_idle_min()
         if (idle_m > 0 and tts and not self._tts_starting and self._state == "idle"
                 and time.time() - self._tts_last_use > idle_m * 60):
-            sh(f"kill $(lsof -ti :{TTS_PORT})")
+            # ВАЖЛИВО: НЕ вбиваємо сервер (`kill lsof :5050` валив увесь Flask →
+            # наступна озвучка = холодний старт ~20с). Шлемо /unload → звільняє
+            # лише модель, Flask лишається живий, теплий старт ~секунди.
+            try:
+                req = urllib.request.Request(f"http://127.0.0.1:{TTS_PORT}/unload",
+                                             data=b"", method="POST")
+                urllib.request.urlopen(req, timeout=4)
+                ok = True
+            except Exception as ex:
+                self._tts_log(f"idle /unload failed: {ex}")
+                ok = False
             self._tts_last_use = time.time()
-            rumps.notification("TTS", "Вивантажено з RAM (простій)",
-                               f"{idle_m} хв без озвучки · підніметься на наступний голос")
-        if self._state == "playing" and self._snd is not None and not self._snd.isPlaying():
+            if ok:
+                rumps.notification("TTS", "Модель вивантажено з RAM (простій)",
+                                   f"{idle_m} хв без озвучки · сервер активний, голос підхопиться миттєво")
+        # ПРИМІТКА (01.07.2026): пробував додати ескалацію — kill+рестарт Flask при
+        # подвійному простої, щоб забрати залишок ~0.5-1ГБ, що /unload не звільняє
+        # (C-алокатор лишає його поки живий процес). ВІДКОЧЕНО: це той самий kill-Flask
+        # підхід, який 22.06.2026 вже був і давав ~20с холодний старт наступної озвучки —
+        # саме заради усунення цього й зробили /unload-only фікс 24.06 (див.
+        # issue_kobzarai_tts_crash). Залишок ~0.5-1ГБ — прийнятна ціна за миттєвий голос
+        # після простою; не переоформлювати без нового рішення користувача.
+        # Латч: «сервер бачили живим». True ставимо коли health відповів; під час
+        # серії промахів НЕ скидаємо (інакше дебаунс краху ламається — was_up впаде
+        # в False після 1-го промаху й крах ніколи не визнається). Скидаємо лише
+        # коли крах підтверджено/сервер навмисно вивантажено.
+        if tts:
+            self._tts_was_up = True
+        elif (self._tts_miss >= 3 and not busy) or self._tts_unloaded:
+            self._tts_was_up = False
+        # Скидаємо «завислий playing» ЛИШЕ коли жоден конвеєр не живий — інакше таймер
+        # ловив проміжок між шматками (стан ще playing, шматок догрався) і занулював
+        # _snd посеред читання → пауза переставала реагувати.
+        if (self._tts_active == 0 and self._state == "playing"
+                and self._snd is not None and not self._snd.isPlaying()):
             self._state = "idle"; self._snd = None
         self._set_icon(up, tts)
         hk = load_cfg().get("hotkeys", {})
@@ -2614,27 +4776,44 @@ class Panel(rumps.App):
             c = fmt_hotkey(hk.get(act)); return "" if c == "—" else c
         try: sw = float(swap)
         except Exception: sw = 0.0
-        warn = "  ⚠" if sw > 3000 else ""
-        self.menu["mem_line"].title = f"RAM вільно {free}% · swap {swap}M{warn}"
+        self.menu["mem_line"].title = f"RAM вільно {free}% · swap {swap}M"
+        self._set_menu_sym(self.menu["mem_line"], "exclamationmark.triangle") if sw > 3000 \
+            else self.menu["mem_line"]._menuitem.setImage_(None)
         set_menu_title(self.menu["speak_sel"], "Озвучити виділене", _ch("speak_sel"))
         set_menu_title(self.menu["speak_clip"], "Озвучити буфер обміну", _ch("speak_clip"))
         set_menu_title(self.menu["tts_stop"], "Стоп озвучку", _ch("tts_stop"))
-        self.menu["ollama_toggle"].title = "■ Зупинити Ollama" if up else "▶ Запустити Ollama"
-        if self._tts_starting:
-            self.menu["tts_toggle"].title = "⏳ Голос запускається…"
+        self.menu["ollama_toggle"].title = "Зупинити Ollama" if up else "Запустити Ollama"
+        self._set_menu_sym(self.menu["ollama_toggle"], "stop.fill" if up else "play.fill")
+        # Підпис-причина прямо під кнопкою: видно ЛИШЕ коли Ollama лежить І диск з
+        # моделями відсутній (саме тоді start-ollama.sh тихо вмирає). Якщо Ollama жива
+        # АБО диск на місці — ховаємо, щоб не «заліпало».
+        reason = self.menu["ollama_reason"]
+        if (not up) and (not os.path.isdir(models_dir())):
+            reason.title = "Не стартує: диск з моделями недоступний"
+            self._set_menu_sym(reason, "exclamationmark.triangle")
+            reason._menuitem.setHidden_(False)
         else:
-            self.menu["tts_toggle"].title = "■ Зупинити голос (TTS)" if tts else "▶ Запустити голос (TTS)"
+            reason._menuitem.setHidden_(True)
+        if self._tts_starting:
+            self.menu["tts_toggle"].title = "Голос запускається…"
+            self._set_menu_sym(self.menu["tts_toggle"], "hourglass")
+        else:
+            self.menu["tts_toggle"].title = "Зупинити голос (TTS)" if tts else "Запустити голос (TTS)"
+            self._set_menu_sym(self.menu["tts_toggle"], "stop.fill" if tts else "play.fill")
         loaded = ps_loaded()
         if loaded:
             nm = loaded[0].split("  ")[0].strip(); sz = ram_size(loaded[0])
             self.menu["loaded_line"].title = "   " + nm + (f"  ·  {sz}" if sz else "")
         else:
             self.menu["loaded_line"].title = "   (нічого — RAM вільна)"
-        if self._state == "synth":   p = "▶ Продовжити (стартує на паузі)" if self._pause_pending else "⏳ Синтез…"
-        elif self._state == "playing": p = "❚❚ Пауза"
-        elif self._state == "paused":  p = "▶ Продовжити"
-        else: p = "Пауза / продовжити"
+        if self._state == "synth":
+            p, sym = ("Продовжити (стартує на паузі)", "play.fill") if self._pause_pending \
+                else ("Синтез…", "hourglass")
+        elif self._state == "playing": p, sym = "Пауза", "pause.fill"
+        elif self._state == "paused":  p, sym = "Продовжити", "play.fill"
+        else: p, sym = "Пауза / продовжити", "pause.fill"
         set_menu_title(self.menu["tts_pause"], p, _ch("tts_pause"))
+        self._set_menu_sym(self.menu["tts_pause"], sym)
         active = self._state in ("synth", "playing", "paused")
         self.menu["tts_stop"].set_callback(self.stop_speech if active else None)
         self.menu["tts_pause"].set_callback(
@@ -2644,12 +4823,27 @@ class Panel(rumps.App):
             self._settings.refresh(up)
 
     # --- Ollama ---
+    def _start_ollama(self):
+        """Старт Ollama з перевіркою диска. start-ollama.sh при відсутній папці моделей
+        тихо робить exit 0 (fire-and-forget Popen → панель не дізнається про провал).
+        Тому перевіряємо доступність тут і ЯВНО кажемо юзеру, якщо диск відпав."""
+        md = models_dir()
+        if not os.path.isdir(md):
+            # без пушу: причину видно прямо в меню (рядок ollama_reason під кнопкою).
+            # Диск відсутній → start-ollama.sh усе одно тихо помер би (exit 0).
+            return False
+        # start_new_session: відв'язати від процес-групи апки, інакше launchd
+        # прибирає Ollama разом із KobzarAI при кожному перезапуску панелі
+        # (TTS-лаунчер це вже робить — тут було пропущено)
+        subprocess.Popen(["bash", START_OLLAMA], start_new_session=True)
+        return True
+
     def toggle_ollama(self, _):
-        if ollama_up(): sh("pkill -f 'ollama serve'"); rumps.notification("Ollama", "Зупинено", "")
-        else: subprocess.Popen(["bash", START_OLLAMA]); rumps.notification("Ollama", "Запуск…", "")
+        if ollama_up(): sh("pkill -f 'ollama serve'"); notify("KobzarAI", "Ollama зупинена", "")
+        elif self._start_ollama(): notify("KobzarAI", "Ollama запускається…", "")
 
     def unload_models(self, _):
-        for r in ps_loaded(): sh(f"{OLLAMA} stop {r.split()[0]}")
+        for r in ps_loaded(): sh(f"{OLLAMA} stop {shlex.quote(r.split()[0])}")
         rumps.notification("Ollama", "Моделі вивантажено з RAM", "сервер далі працює")
 
     # --- TTS сервер ---
@@ -2657,14 +4851,92 @@ class Panel(rumps.App):
         if tts_up():
             sh(f"kill $(lsof -ti :{TTS_PORT})")
             self._tts_starting = False
+            # КРИТ.: позначити як НАВМИСНУ зупинку, інакше watchdog у refresh()
+            # бачить «port :5050 dead» і піднімає сервер назад (юзер мусив клікати
+            # стоп кілька разів наввипередки). _start_tts_server скидає цей прапорець.
+            self._tts_unloaded = True
+            self._tts_was_up = False
+            self._tts_miss = 0
             rumps.notification("TTS", "Сервер зупинено", "")
         else:
             self._start_tts_server()
             rumps.notification("TTS", "Сервер запускається…", "перша загрузка ~20с (torch+модель)")
 
+    def _log(self, msg):
+        """Загальний лог застосунку → ~/.local/kobzarai/logs/app.log (події сервісів,
+        крахи, відкриття вікон). Щоб видно було «що відбувається», коли щось падає само."""
+        try:
+            p = os.path.expanduser("~/.local/kobzarai/logs/app.log")
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            try:    # м'яка ротація
+                if os.path.exists(p) and os.path.getsize(p) > 1_000_000:
+                    with open(p, "r", errors="replace") as f:
+                        tail = f.readlines()[-2000:]
+                    with open(p, "w") as f:
+                        f.writelines(tail)
+            except Exception: pass
+            free, swap = mem()
+            with open(p, "a") as f:
+                f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}  "
+                        f"(free {free}% swap {swap}M)\n")
+        except Exception:
+            pass
+
+    def _tts_log(self, msg):
+        """Краш-трейс/події TTS → tts.log І дзеркало у загальний app.log."""
+        self._log("TTS: " + msg)
+        try:
+            p = getattr(self, "_tts_logpath", None) or os.path.expanduser(
+                "~/.local/kobzarai/logs/tts.log")
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "a") as f:
+                f.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
+        except Exception:
+            pass
+
     def _start_tts_server(self):
+        self._tts_unloaded = False     # явний старт скидає позначку «навмисно вивантажено»
+        # Лок проти подвійного старту: start-tts.sh уже гардить по lsof :5050,
+        # але _tts_starting не дає панелі плодити паралельні bash поки сервер гріється.
+        if getattr(self, "_tts_starting", False) and tts_up():
+            return
         self._tts_starting = True
-        subprocess.Popen(["bash", f"{TTS_DIR}/start-tts.sh"], start_new_session=True)
+        # mps ВІДКОЧЕНО (01.07.2026): дав 2-4× швидший синтез, АЛЕ vmmap показав реальний
+        # Physical Footprint ~3.9-4.1 ГБ (Metal/GPU-буфери НЕ видно в `ps` RSS, тому перша
+        # перевірка це проґавила) — на 8 ГБ це дорожче за виграш у швидкості, саме воно
+        # душило машину в своп. Дефолт знову cpu; TTS_DEVICE з оточення й далі перекриває,
+        # якщо колись захочеться увімкнути вручну на машині з більшим запасом RAM.
+        srv_env = {**os.environ,
+                   "TTS_DEVICE": os.environ.get("TTS_DEVICE", "cpu"),
+                   "PYTORCH_ENABLE_MPS_FALLBACK": "1"}
+        # КРИТ.: output server.py раніше йшов у /dev/null → причину крахів (OOM/трейс)
+        # неможливо було прочитати. Тепер пишемо у app-scoped лог (НЕ чіпаючи спільний
+        # з Cherry start-tts.sh). Тримаємо хвіст: при старті лишаємо ~2000 рядків.
+        try:
+            logdir = os.path.expanduser("~/.local/kobzarai/logs")
+            os.makedirs(logdir, exist_ok=True)
+            logpath = os.path.join(logdir, "tts.log")
+            self._tts_logpath = logpath
+            try:    # м'яка ротація: щоб лог не ріс безмежно
+                if os.path.exists(logpath) and os.path.getsize(logpath) > 1_000_000:
+                    with open(logpath, "r", errors="replace") as f:
+                        tail = f.readlines()[-2000:]
+                    with open(logpath, "w") as f:
+                        f.writelines(tail)
+            except Exception: pass
+            lf = open(logpath, "a", buffering=1)
+            lf.write(f"\n===== TTS START {time.strftime('%Y-%m-%d %H:%M:%S')} =====\n")
+            lf.flush()
+            subprocess.Popen(["bash", f"{TTS_DIR}/start-tts.sh"],
+                             stdout=lf, stderr=subprocess.STDOUT, start_new_session=True,
+                             env=srv_env)
+            lf.close()          # дочірній процес вже задублював fd собі — батьківський більше не потрібен
+        except Exception:
+            if 'lf' in locals():
+                try: lf.close()
+                except Exception: pass
+            subprocess.Popen(["bash", f"{TTS_DIR}/start-tts.sh"], start_new_session=True,
+                             env=srv_env)
 
     def _wait_tts(self, secs=40):
         if tts_up(): return True
@@ -2683,16 +4955,27 @@ class Panel(rumps.App):
         payload = json.dumps({"model": "styletts2-ua", "input": ch,
                               "voice": self.voice,
                               "speed": getattr(self, "speed", 1.0),
-                              "pause": getattr(self, "pause", 0.15)}).encode()
+                              "pause": getattr(self, "pause", 0.15),
+                              "group_chars": TTS_GROUP_CHARS}).encode()
         req = urllib.request.Request(f"http://127.0.0.1:{TTS_PORT}/v1/audio/speech",
                                      payload, {"Content-Type": "application/json"})
         audio = urllib.request.urlopen(req, timeout=120).read()
         self._tts_last_use = time.time()          # скидаємо лічильник простою
         if gen != self._speak_gen: return None
+        # попередній temp-WAV на цей момент уже дограв (_play_sound синхронний,
+        # повертається лише після завершення шматка) — можна прибрати, інакше
+        # накопичуються в /tmp без обмеження
+        prev = getattr(self, "_last_tmp_wav", None)
+        if prev:
+            try: os.remove(prev)
+            except Exception: pass
         f = tempfile.NamedTemporaryFile(suffix=".wav", delete=False); f.write(audio); f.close()
+        self._last_tmp_wav = f.name
         snd = NSSound.alloc().initWithContentsOfFile_byReference_(f.name, True)
         if snd is not None:
-            try: snd.setPlaybackDeviceIdentifier_(None)
+            try: snd.setVolume_(float(getattr(self, "volume", 1.0)))
+            except Exception: pass
+            try: snd.setPlaybackDeviceIdentifier_(getattr(self, "out_device", None))  # None=системний
             except Exception: pass
         return snd
 
@@ -2707,6 +4990,17 @@ class Panel(rumps.App):
             self._state = "paused"
         else:
             self._state = "playing"
+        # play() повертає одразу, isPlaying() ще не True кілька мс — без цього
+        # очікування перший же опит нижче бачив False і шматок мовчки проскакував
+        # (на довгих текстах багато шматків → читання «обривалося»).
+        t0 = time.time()
+        while not snd.isPlaying() and self._state != "paused":
+            if gen != self._speak_gen:
+                try: snd.stop()
+                except Exception: pass
+                return False
+            if time.time() - t0 > 1.0: break    # звук міг бути порожній/миттєвий — не зависаємо
+            time.sleep(0.01)
         while True:
             if gen != self._speak_gen:
                 try: snd.stop()
@@ -2727,9 +5021,10 @@ class Panel(rumps.App):
         self._state = "synth"
         if tts_mode() != "base":                   # stream і realtime → конвеєр для ручного озвучення
             self._speak_stream(text, gen); return
-        chunks = split_blocks(text[:6000]) or [text[:700]]
+        chunks = split_blocks(text[:TTS_MAX_CHARS]) or [text[:700]]
         def run():
             pool = NSAutoreleasePool.alloc().init()
+            self._tts_active += 1
             try:
                 if not self._wait_tts():
                     self._state = "idle"; rumps.notification("TTS", "Сервер не піднявся", ""); return
@@ -2745,13 +5040,13 @@ class Panel(rumps.App):
             except Exception as ex:
                 self._state = "idle"; rumps.notification("TTS", "Помилка", str(ex)[:80])
             finally:
-                del pool
+                self._tts_active -= 1; del pool
         threading.Thread(target=run, daemon=True).start()
 
     def _speak_stream(self, text, gen):
         """Конвеєр ①: продюсер синтезує наступний шматок у фоні, поки плеєр грає
         поточний → майже миттєвий старт, без дірок між реченнями. База не чіпається."""
-        chunks = split_stream(text[:6000]) or [text[:700]]
+        chunks = split_stream(text[:TTS_MAX_CHARS]) or [text[:700]]
         _q = __import__("queue")
         q = _q.Queue(maxsize=1)                       # prefetch на 1 шматок наперед
         END = object()                                # маркер кінця (≠ пропущений шматок)
@@ -2779,6 +5074,7 @@ class Panel(rumps.App):
 
         def consumer():
             pool = NSAutoreleasePool.alloc().init()
+            self._tts_active += 1
             try:
                 if not self._wait_tts():
                     self._state = "idle"; rumps.notification("TTS", "Сервер не піднявся", ""); return
@@ -2802,7 +5098,7 @@ class Panel(rumps.App):
             except Exception as ex:
                 self._state = "idle"; rumps.notification("TTS", "Помилка", str(ex)[:80])
             finally:
-                del pool
+                self._tts_active -= 1; del pool
         threading.Thread(target=consumer, daemon=True).start()
 
     # ── РЕАЛТАЙМ: відкрита черга — годуємо реченнями LLM на льоту (Donatello-ефект) ──
@@ -2848,6 +5144,7 @@ class Panel(rumps.App):
         def play_loop():
             pool = NSAutoreleasePool.alloc().init()
             first = True
+            self._tts_active += 1
             try:
                 while True:
                     if gen != self._speak_gen: return
@@ -2867,7 +5164,7 @@ class Panel(rumps.App):
             except Exception:
                 self._state = "idle"
             finally:
-                del pool
+                self._tts_active -= 1; del pool
         threading.Thread(target=synth_loop, daemon=True).start()
         threading.Thread(target=play_loop, daemon=True).start()
         return gen
@@ -2913,9 +5210,15 @@ class Panel(rumps.App):
         if self._state == "synth":              # ще синтезуємо — озброюємо/знімаємо відкладену паузу
             self._pause_pending = not self._pause_pending
             return
-        if self._snd is None: return
+        if self._snd is None:
+            # конвеєр живий, але між шматками звуку ще нема → відкладена пауза на наступний
+            if self._tts_active: self._pause_pending = not self._pause_pending
+            return
         if self._state == "playing":
-            if self._snd.pause(): self._state = "paused"
+            if self._snd.isPlaying():
+                if self._snd.pause(): self._state = "paused"
+            elif self._tts_active:              # шматок догрався, наступний ще не стартував
+                self._pause_pending = not self._pause_pending
         elif self._state == "paused":
             if self._snd.resume(): self._state = "playing"
 
@@ -2926,10 +5229,15 @@ class Panel(rumps.App):
             try: self._snd.stop()
             except Exception: pass
         self._snd = None; self._state = "idle"
+        prev = getattr(self, "_last_tmp_wav", None)
+        if prev:
+            try: os.remove(prev)
+            except Exception: pass
+            self._last_tmp_wav = None
 
     def quit_all(self, _):
         self.stop_speech(None)
-        for r in ps_loaded(): sh(f"{OLLAMA} stop {r.split()[0]}")
+        for r in ps_loaded(): sh(f"{OLLAMA} stop {shlex.quote(r.split()[0])}")
         sh("pkill -f 'ollama serve'")
         sh(f"kill $(lsof -ti :{TTS_PORT})")
         rumps.quit_application()
@@ -2942,9 +5250,34 @@ if __name__ == "__main__":
             t.stop(); _p.open_settings(None)
             if os.environ.get("KOBZARAI_CHAT_DEMO") and _p._settings:
                 s = _p._settings
+                s.sessions[0]["title"] = "Три кольори"
+                s.sessions[0]["ts"] = time.time()
                 s.sessions[0]["history"] = [
                     {"role": "user", "content": "Привіт! Назви три кольори українською."},
                     {"role": "assistant", "content": "Звісно: червоний, зелений та синій."}]
-                s._render_session()
+                s.sessions.append({"title": "Рецепт борщу", "ts": time.time() - 86400,
+                    "history": [{"role": "user", "content": "Як зварити борщ?"},
+                    {"role": "assistant", "content": "1. Бульйон.\n2. Засмажка.\n3. Капуста + картопля."}]})
+                s.sessions.append({"title": "Python-питання", "ts": time.time() - 5 * 86400,
+                                   "history": []})
+                s._reload_hist(); s._render_session()
+            _sv = os.environ.get("KOBZARAI_SCROLLTEST")   # тест-хук: проскролити на N px
+            if _sv and _p._settings and _p._settings._scroll is not None:
+                def _do_scroll(t2):
+                    t2.stop()
+                    try:
+                        clip = _p._settings._scroll.contentView()
+                        o = clip.bounds().origin
+                        clip.scrollToPoint_((o.x, float(_sv)))
+                        _p._settings._scroll.reflectScrolledClipView_(clip)
+                        _ls = os.environ.get("KOBZARAI_LIBSEL")   # тест-хук: виділити рядок бібліотеки
+                        lt = getattr(_p._settings, "lib_table", None)
+                        if _ls and lt is not None:
+                            from Foundation import NSIndexSet
+                            lt.selectRowIndexes_byExtendingSelection_(
+                                NSIndexSet.indexSetWithIndex_(int(_ls)), False)
+                    except Exception as e:
+                        print("scrolltest err", e)
+                rumps.Timer(_do_scroll, 1.5).start()
         rumps.Timer(_open_once, 1).start()
     _p.run()

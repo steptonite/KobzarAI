@@ -1,3 +1,8 @@
-rumps
-pyobjc
-pillow
+# KobzarAI — рантайм-залежності панелі (panel.py + kb.py).
+# Встановлення у venv апки:  .venv/bin/python -m pip install -r requirements.txt
+pyobjc==12.2.1            # AppKit/PyObjC — все нативне вікно й меню-бар
+rumps==0.4.0             # меню-бар застосунок
+sqlite-vec==0.1.9        # читання ГОТОВИХ векторних індексів (База знань). Без нього
+                         #   лишається лише власна індексація теки (kb.py, чистий stdlib).
+# База знань також потребує Ollama з моделлю bge-m3 (embed) — тягнеться самою апкою,
+# не через pip. StyleTTS2-сервер (озвучка) — окремий, спільний із Cherry Studio.
