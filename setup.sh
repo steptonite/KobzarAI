@@ -41,11 +41,39 @@ if ! command -v brew >/dev/null; then
 fi
 command -v brew >/dev/null || { echo "✗ Homebrew не встановився. Постав вручну: https://brew.sh, потім запусти ./setup.sh знову."; exit 1; }
 
-PY="$(brew --prefix)/opt/python@3.12/bin/python3.12"
-if [ ! -x "$PY" ]; then echo "→ Встановлюю Python 3.12…"; brew install python@3.12; fi
-[ -x "$PY" ] || PY="python3"                       # фолбек на системний
+# 🔴 Мовчазний фолбек на системний python3 (це 3.9) робив venv, у якому pyobjc
+#    або не ставиться, або ставиться кривим — і апка потім не малює меню-бар.
+#    Урок Pysar: перевіряти ВЕРСІЮ, а не наявність. Порядок не «найновіший»:
+#    колеса pyobjc відстають від свіжого CPython.
+PY=""
+for CAND in "$(brew --prefix)/opt/python@3.12/bin/python3.12" \
+            "$(brew --prefix)/opt/python@3.13/bin/python3.13" \
+            "$(brew --prefix)/opt/python@3.11/bin/python3.11"; do
+  [ -x "$CAND" ] && { PY="$CAND"; break; }
+done
+if [ -z "$PY" ]; then
+  echo "→ Встановлюю Python 3.12…"; brew install python@3.12
+  PY="$(brew --prefix)/opt/python@3.12/bin/python3.12"
+fi
+if [ ! -x "$PY" ] || ! "$PY" -c 'import sys; sys.exit(0 if sys.version_info >= (3,11) else 1)'; then
+  echo "✗ Потрібен Python 3.11+ від Homebrew, а знайдено: $("${PY:-python3}" -V 2>&1)"
+  echo "  Системний python3 (3.9) не підходить: на ньому pyobjc не збереться і меню-бар не з'явиться."
+  echo "  Постав вручну:  brew install python@3.12   — і запусти ./setup.sh знову."
+  exit 1
+fi
+echo "→ Python: $("$PY" -V) ($PY)"
 
-command -v ollama >/dev/null || { echo "→ Встановлюю Ollama…"; brew install ollama; }
+# 🔴 Нативний Ollama.app (з ollama.com) кладе CLI повз PATH. Без цієї перевірки
+#    brew ставив ДРУГУ копію, і дві Ollama билися за порт 11434 та ~/.ollama/models.
+if command -v ollama >/dev/null; then
+  :
+elif [ -d "/Applications/Ollama.app" ] || [ -x "/usr/local/bin/ollama" ]; then
+  echo "→ Ollama вже стоїть як окремий застосунок — другу копію не ставлю."
+  echo "  Якщо він конфліктуватиме з панеллю: лиши щось одне (застосунок АБО brew-сервіс)."
+  export PATH="/usr/local/bin:$PATH"
+else
+  echo "→ Встановлюю Ollama…"; brew install ollama
+fi
 
 # 3. Панель
 echo "→ Панель → $PANEL_DIR"
@@ -99,7 +127,17 @@ fi
 
 # 7. Іконка + застосунок KobzarAI.app (клікабельний, як звичайна програма)
 echo "→ Іконка та KobzarAI.app…"
-"$PANEL_DIR/.venv/bin/python" "$PANEL_DIR/make_icon.py" >/dev/null 2>&1 || true
+"$PANEL_DIR/.venv/bin/python" "$PANEL_DIR/make_icon.py" >/tmp/kobzarai-icon.log 2>&1 || \
+  echo "  ⚠️ генератор іконки не відпрацював (деталі: /tmp/kobzarai-icon.log) — беру запасний шлях"
+# Запасний шлях без Pillow: зібрати .icns із готового icon.png системними sips/iconutil.
+if [ ! -f "$PANEL_DIR/app.icns" ] && [ -f "$REPO/panel/icon.png" ]; then
+  ICONSET="$(mktemp -d)/app.iconset"; mkdir -p "$ICONSET"
+  for SZ in 16 32 64 128 256 512; do
+    sips -z $SZ $SZ "$REPO/panel/icon.png" --out "$ICONSET/icon_${SZ}x${SZ}.png" >/dev/null 2>&1
+    sips -z $((SZ*2)) $((SZ*2)) "$REPO/panel/icon.png" --out "$ICONSET/icon_${SZ}x${SZ}@2x.png" >/dev/null 2>&1
+  done
+  iconutil -c icns "$ICONSET" -o "$PANEL_DIR/app.icns" >/dev/null 2>&1 && echo "  ✓ іконку зібрано запасним шляхом"
+fi
 # KOBZARAI_APP_DIR — щоб установку можна було прогнати в ізольованому HOME,
 # не чіпаючи /Applications живої машини. Без неї тест ламає робочу копію.
 APP_DIR="${KOBZARAI_APP_DIR:-/Applications}"; [ -w "$APP_DIR" ] || APP_DIR="$HOME/Applications"
