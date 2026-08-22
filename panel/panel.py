@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # KobzarAI — menu-bar керування Ollama + TTS + RAM + глобальні хоткеї. Без автозапуску, ручний СТОП.
-import os, subprocess, tempfile, threading, time, urllib.request, json, shlex, re
+import os, subprocess, tempfile, threading, time, urllib.request, json, shlex, re, shutil
 import rumps
 import objc
 from AppKit import (NSImage, NSSound, NSWindow, NSBackingStoreBuffered,
@@ -30,17 +30,83 @@ from Quartz import CAGradientLayer, CATransaction
 from WebKit import WKWebView, WKWebViewConfiguration
 from PyObjCTools import AppHelper
 
-APA = os.environ.get("KOBZARAI_DISK", "/Volumes/ExternalSSD")
-OLLAMA = "/opt/homebrew/bin/ollama"
-DEFAULT_MODELS_DIR = f"{APA}/ollama-models"
+# 🔴 22.08.2026, перша чужа установка (Катя, M4). Тут стояло два хардкоди автора,
+# і разом вони робили панель мертвою на будь-якій іншій машині:
+#   APA = "/Volumes/ExternalSSD"  → моделі шукались на томі, якого в неї нема;
+#   OLLAMA = "/opt/homebrew/..."  → на Intel і при нативному Ollama.app бінарника
+#                                   за цим шляхом немає, і `ollama list` мовчки порожній.
+# setup.sh тим часом чесно ставив Ollama і тягнув bge-m3 у СТАНДАРТНУ ~/.ollama/models.
+# Тобто інсталятор і панель не домовлялись між собою — людина бачила «нічого не працює».
+# Правило: жоден шлях, унікальний для машини автора, не має права бути дефолтом.
+
+def _find_ollama() -> str:
+    """CLI Ollama там, де він реально стоїть. Порожній рядок = не встановлена."""
+    env = (os.environ.get("KOBZARAI_OLLAMA_BIN") or "").strip()
+    cands = [env] if env else []
+    cands.append(shutil.which("ollama") or "")
+    cands += ["/opt/homebrew/bin/ollama", "/usr/local/bin/ollama",
+              "/Applications/Ollama.app/Contents/Resources/ollama"]
+    for c in cands:
+        if c and os.path.isfile(c) and os.access(c, os.X_OK):
+            return c
+    return ""
+
+
+OLLAMA_BIN = _find_ollama()
+# для команд лишаємо голе ім'я: без бінарника вони мають провалитись чесно,
+# а не перетворитись на виклик чужої команди через порожній префікс
+OLLAMA = OLLAMA_BIN or "ollama"
+DEFAULT_MODELS_DIR = os.path.expanduser("~/.ollama/models")
+# Зовнішній диск лишається можливим — але як СВІДОМИЙ вибір людини
+# (поле «Папка моделей» у Налаштуваннях або KOBZARAI_DISK), не як дефолт.
+DISK = (os.environ.get("KOBZARAI_DISK") or "").strip()
+
+
+def ollama_blocker():
+    """Що саме заважає підняти Ollama: (короткий підпис у меню, пояснення людині).
+    None = перешкод нема. Три причини раніше зливались в одну фразу «диск з
+    моделями недоступний» — вона брехала тому, у кого ніякого диска й не було."""
+    if not OLLAMA_BIN:
+        return ("Не стартує: Ollama не встановлена",
+                "Панель не знайшла Ollama на цьому Mac.\n\n"
+                "Постав її однією з команд:\n"
+                "    brew install ollama\n"
+                "або завантаж застосунок з ollama.com\n\n"
+                "Після встановлення перезапусти KobzarAI.")
+    if not os.path.isfile(START_OLLAMA):
+        return ("Не стартує: немає лаунчера",
+                f"Немає файлу {START_OLLAMA}.\n\n"
+                "Його кладе інсталятор. Виконай у теці KobzarAI:\n"
+                "    ./setup.sh")
+    md = models_dir()
+    if not os.path.isdir(md):
+        return ("Не стартує: папка моделей недоступна",
+                f"Панель шукає моделі тут:\n    {md}\n\n"
+                "Такої папки нема. Якщо це зовнішній диск — під'єднай його.\n"
+                "Якщо моделі лежать деінде — вкажи шлях у\n"
+                "Налаштування → Загальні → Папка моделей.")
+    return None
 
 
 def models_dir():
-    """Папка моделей: спершу config.json (UI), інакше дефолт."""
+    """Папка моделей: config.json (UI) → KOBZARAI_DISK → OLLAMA_MODELS → стандартна.
+
+    Якщо заданий шлях недоступний (відпав зовнішній диск), а стандартна папка
+    з моделями на місці — беремо її. Інакше панель тихо мертва саме тоді,
+    коли причину найважче вгадати."""
     try:
-        return load_cfg().get("models_dir") or DEFAULT_MODELS_DIR
+        chosen = (load_cfg().get("models_dir") or "").strip()
     except Exception:
-        return DEFAULT_MODELS_DIR
+        chosen = ""
+    if not chosen and DISK:
+        chosen = f"{DISK}/ollama-models"
+    if not chosen:
+        chosen = (os.environ.get("OLLAMA_MODELS") or "").strip()
+    if chosen and os.path.isdir(chosen):
+        return chosen
+    if chosen and os.path.isdir(os.path.join(DEFAULT_MODELS_DIR, "manifests")):
+        return DEFAULT_MODELS_DIR      # заданий шлях відпав, стандартний живий
+    return chosen or DEFAULT_MODELS_DIR
 START_OLLAMA = os.path.expanduser("~/.ollama/start-ollama.sh")
 TTS_DIR = os.path.expanduser("~/.local/styletts2-ua-server")
 TTS_PORT = 5050
@@ -4878,8 +4944,9 @@ class Panel(rumps.App):
         # моделями відсутній (саме тоді start-ollama.sh тихо вмирає). Якщо Ollama жива
         # АБО диск на місці — ховаємо, щоб не «заліпало».
         reason = self.menu["ollama_reason"]
-        if (not up) and (not os.path.isdir(models_dir())):
-            reason.title = "Не стартує: диск з моделями недоступний"
+        blocker = None if up else ollama_blocker()
+        if blocker:
+            reason.title = blocker[0]
             self._set_menu_sym(reason, "exclamationmark.triangle")
             reason._menuitem.setHidden_(False)
         else:
@@ -4917,10 +4984,14 @@ class Panel(rumps.App):
         """Старт Ollama з перевіркою диска. start-ollama.sh при відсутній папці моделей
         тихо робить exit 0 (fire-and-forget Popen → панель не дізнається про провал).
         Тому перевіряємо доступність тут і ЯВНО кажемо юзеру, якщо диск відпав."""
-        md = models_dir()
-        if not os.path.isdir(md):
-            # без пушу: причину видно прямо в меню (рядок ollama_reason під кнопкою).
-            # Диск відсутній → start-ollama.sh усе одно тихо помер би (exit 0).
+        blocker = ollama_blocker()
+        if blocker:
+            # 🔴 Раніше тут був голий `return False`: людина тиснула «Запустити
+            # Ollama» і НІЧОГО не відбувалось — ні вікна, ні помилки. Причина
+            # лежала рядком у меню, яке закривається в мить кліку, тобто її
+            # фактично не існувало. Той самий урок уже стоїть у _start_tts_server
+            # десятьма екранами нижче — сюди його не донесли.
+            rumps.alert(title="Ollama не запускається", message=blocker[1])
             return False
         # start_new_session: відв'язати від процес-групи апки, інакше launchd
         # прибирає Ollama разом із KobzarAI при кожному перезапуску панелі
