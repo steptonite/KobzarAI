@@ -7,6 +7,21 @@
 # завантажуються при першому використанні (моделі — твоїм `ollama pull`).
 set -e
 
+# Прапорці (див. README):
+#   --no-tts   пропустити українську озвучку (torch + голоси ≈ кілька ГБ і довго).
+#              Потрібна панель Ollama і більше нічого — це твій режим.
+#   --embed    одразу завантажити bge-m3 — модель семантичного пошуку.
+#              Бери, якщо ставиш Кобзаря під Second Brain Kit.
+WITH_TTS=1; WITH_EMBED=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --no-tts) WITH_TTS=0; shift ;;
+    --embed)  WITH_EMBED=1; shift ;;
+    -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
+    *) echo "Невідомий аргумент: $1" >&2; exit 2 ;;
+  esac
+done
+
 # 1. Тільки Apple Silicon
 if [ "$(uname -m)" != "arm64" ]; then
   echo "✗ KobzarAI — лише macOS на Apple Silicon (M1/M2/M3…). Перервано."
@@ -35,38 +50,59 @@ command -v ollama >/dev/null || { echo "→ Встановлюю Ollama…"; bre
 # 3. Панель
 echo "→ Панель → $PANEL_DIR"
 mkdir -p "$PANEL_DIR"
-cp "$REPO/panel/panel.py" "$REPO/panel/make_icon.py" "$PANEL_DIR/"
+cp "$REPO/panel/panel.py" "$REPO/panel/make_icon.py" "$REPO/panel/kb.py" "$PANEL_DIR/"
+rm -rf "$PANEL_DIR/ui"; cp -R "$REPO/panel/ui" "$PANEL_DIR/ui"
 "$PY" -m venv "$PANEL_DIR/.venv"
 "$PANEL_DIR/.venv/bin/pip" install -q --upgrade pip
 "$PANEL_DIR/.venv/bin/pip" install -q -r "$REPO/panel/requirements.txt"
 
-# 4. TTS-сервер
-echo "→ TTS-сервер → $TTS_DIR (тягне torch — буде довго)"
-mkdir -p "$TTS_DIR/voices"
-cp "$REPO/tts-server/server.py" "$REPO/tts-server/start-tts.sh" "$REPO/tts-server/requirements.txt" "$TTS_DIR/"
-"$PY" -m venv "$TTS_DIR/.venv"
-"$TTS_DIR/.venv/bin/pip" install -q --upgrade pip
-"$TTS_DIR/.venv/bin/pip" install -q -r "$TTS_DIR/requirements.txt"
-echo "→ Ресурси нормалізації (nltk для g2p_en)…"
-"$TTS_DIR/.venv/bin/python" -c "import nltk; nltk.download('averaged_perceptron_tagger_eng'); nltk.download('cmudict')" 2>/dev/null || true
-echo "→ Голоси (patriotyk/styletts2-ukrainian: filatov + voices/)…"
-"$TTS_DIR/.venv/bin/python" - "$TTS_DIR" <<'PY'
+# 4. TTS-сервер (пропускається з --no-tts)
+if [ "$WITH_TTS" = 1 ]; then
+  echo "→ TTS-сервер → $TTS_DIR (тягне torch — буде довго)"
+  mkdir -p "$TTS_DIR/voices"
+  cp "$REPO/tts-server/server.py" "$REPO/tts-server/start-tts.sh" "$REPO/tts-server/requirements.txt" "$TTS_DIR/"
+  "$PY" -m venv "$TTS_DIR/.venv"
+  "$TTS_DIR/.venv/bin/pip" install -q --upgrade pip
+  "$TTS_DIR/.venv/bin/pip" install -q -r "$TTS_DIR/requirements.txt"
+  echo "→ Ресурси нормалізації (nltk для g2p_en)…"
+  "$TTS_DIR/.venv/bin/python" -c "import nltk; nltk.download('averaged_perceptron_tagger_eng'); nltk.download('cmudict')" 2>/dev/null || true
+  echo "→ Голоси (patriotyk/styletts2-ukrainian: filatov + voices/)…"
+  "$TTS_DIR/.venv/bin/python" - "$TTS_DIR" <<'PY'
 import sys
 from huggingface_hub import snapshot_download
 snapshot_download(repo_id="patriotyk/styletts2-ukrainian", repo_type="space",
-                  allow_patterns=["filatov.pt", "voices/*.pt"], local_dir=sys.argv[1])
+                    allow_patterns=["filatov.pt", "voices/*.pt"], local_dir=sys.argv[1])
 print("  голоси завантажено")
 PY
+else
+  echo "→ Озвучку пропущено (--no-tts). Додати пізніше: ./setup.sh"
+fi
 
 # 5. Лаунчер Ollama
 mkdir -p "$HOME/.ollama"
 cp "$REPO/panel/start-ollama.sh" "$HOME/.ollama/start-ollama.sh"
 chmod +x "$HOME/.ollama/start-ollama.sh"
 
-# 6. Іконка + застосунок KobzarAI.app (клікабельний, як звичайна програма)
+# 6. Модель семантичного пошуку (--embed)
+if [ "$WITH_EMBED" = 1 ]; then
+  echo "→ Модель пошуку bge-m3 (~1.2 ГБ)…"
+  # pull потребує живого сервера; якщо він уже піднятий — чужий процес не чіпаємо.
+  OWN_SERVE=0
+  if ! ollama list >/dev/null 2>&1; then
+    ollama serve >/tmp/kobzarai-ollama-setup.log 2>&1 &
+    OWN_SERVE=$!
+    for _ in $(seq 1 30); do ollama list >/dev/null 2>&1 && break; sleep 1; done
+  fi
+  ollama pull bge-m3 </dev/null || echo "  ⚠️ bge-m3 не завантажилась — доробиш кнопкою в панелі"
+  [ "$OWN_SERVE" != 0 ] && kill "$OWN_SERVE" 2>/dev/null || true
+fi
+
+# 7. Іконка + застосунок KobzarAI.app (клікабельний, як звичайна програма)
 echo "→ Іконка та KobzarAI.app…"
 "$PANEL_DIR/.venv/bin/python" "$PANEL_DIR/make_icon.py" >/dev/null 2>&1 || true
-APP_DIR="/Applications"; [ -w "$APP_DIR" ] || APP_DIR="$HOME/Applications"
+# KOBZARAI_APP_DIR — щоб установку можна було прогнати в ізольованому HOME,
+# не чіпаючи /Applications живої машини. Без неї тест ламає робочу копію.
+APP_DIR="${KOBZARAI_APP_DIR:-/Applications}"; [ -w "$APP_DIR" ] || APP_DIR="$HOME/Applications"
 mkdir -p "$APP_DIR"
 APP="$APP_DIR/KobzarAI.app"
 rm -rf "$APP"
@@ -111,6 +147,8 @@ chmod +x "$APP/Contents/MacOS/KobzarAI"
 cat <<EOF
 
 ✓ Готово. KobzarAI.app → $APP
+  озвучка: $([ "$WITH_TTS" = 1 ] && echo "встановлена" || echo "пропущена (--no-tts)")
+  bge-m3:  $([ "$WITH_EMBED" = 1 ] && echo "завантажена" || echo "не завантажувалась")
 
 Далі — два кроки мишкою:
   1) Запусти KobzarAI з Launchpad.

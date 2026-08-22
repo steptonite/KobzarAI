@@ -47,7 +47,42 @@ TTS_PORT = 5050
 TTS_MAX_CHARS = 200000          # стеля довжини озвучення (~ глава книги); раніше 6000 мовчки різало великі тексти
 TTS_GROUP_CHARS = 200           # таргет довжини спана синтезу на сервері (server: дефолт 20=Cherry); більший = менше стиків, менше рваності
 OLLAMA_HOST = "127.0.0.1:11434"
-VOICES = ["Артем Окороков", "Анастасія Павленко", "Денис Денисенко", "filatov"]
+VOICES_FALLBACK = ["Артем Окороков", "Анастасія Павленко", "Денис Денисенко", "filatov"]
+
+
+def _fetch_voices():
+    """Список голосів беремо з СЕРВЕРА, не з константи.
+
+    🔴 ЧОМУ: тут роками стояли захардкожені 4 імені, а сервер віддає 31 —
+    решта 27 голосів фізично лежали в `voices/` і були недосяжні з панелі.
+    Джерело правди — той, хто ці голоси вміє синтезувати. Статичний список
+    лишається лише як фолбек на випадок, коли сервер ще не піднявся."""
+    try:
+        import json as _json
+        import urllib.request as _u
+        with _u.urlopen(f"http://127.0.0.1:{TTS_PORT}/voices", timeout=2) as r:
+            d = _json.loads(r.read().decode("utf-8"))
+        names = list(d.get("multispeaker") or []) + list(d.get("single") or [])
+        return names or VOICES_FALLBACK
+    except Exception:
+        return VOICES_FALLBACK
+
+
+VOICES = _fetch_voices()
+
+
+def refresh_voices():
+    """Перечитати список із сервера перед показом вибору.
+
+    ЧОМУ не досить разового читання на старті: панель САМА піднімає TTS-сервер,
+    тож на момент імпорту його ще нема → лишився б фолбек із 4 імен, і людина
+    знову не побачила б решту. Тому список оновлюється щоразу, коли його
+    показують; коштує це один локальний GET."""
+    global VOICES
+    fresh = _fetch_voices()
+    if fresh and fresh != VOICES:
+        VOICES = fresh
+    return VOICES
 VOICE_LABELS = {"filatov": "Filatov"}          # серверні ключі lowercase → людський підпис
 def voice_label(v): return VOICE_LABELS.get(v, v)
 CONFIG = os.path.expanduser("~/.local/kobzarai/config.json")
@@ -1608,8 +1643,38 @@ class SettingsWindow(NSObject):
         else:
             self.win.makeFirstResponder_(None)   # без авто-фокуса поля (кільце лише на клік)
         self.reload_models()
+        self._sync_voices()
         self._refresh_chat_header()
         self.refresh()
+
+    @objc.python_method
+    def _sync_voices(self):
+        """Перечитати голоси з сервера і ПЕРЕЗІБРАТИ пункти попапа на кожному показі.
+
+        🔴 ЧОМУ цього не робить `refresh_voices()` у `_page_voice`: сторінки
+        будуються РІВНО ОДИН раз (`_build`), а вікно кешується у `panel._settings`.
+        Перше відкриття зазвичай припадає на момент, коли панель щойно підняла
+        TTS-сервер і `/voices` ще не відповідає за 2 с ⇒ у попап назавжди сідає
+        фолбек із 4 імен, і жоден рестарт застосунку цього не лікує (сценарій
+        01.08.2026: сервер віддає 31 голос, у вікні досі 4)."""
+        pop = getattr(self, "voice_pop", None)
+        if pop is None:
+            return
+        try:
+            names = refresh_voices()
+            titles = [voice_label(x) for x in names]
+            if list(pop.itemTitles()) == titles:
+                return
+            prev = pop.titleOfSelectedItem()
+            pop.removeAllItems()
+            pop.addItemsWithTitles_(titles)
+            want = voice_label(getattr(self.panel, "voice", None) or names[0])
+            for t in (want, prev):
+                if t and t in titles:
+                    pop.selectItemWithTitle_(t)
+                    break
+        except Exception:
+            pass                            # список голосів не має ламати відкриття вікна
 
     def windowWillClose_(self, note):
         self.is_open = False
@@ -2370,8 +2435,10 @@ class SettingsWindow(NSObject):
     def _page_voice(self, *_):
         p = self.panel
         # — Озвучення —
+        refresh_voices()                    # сервер = джерело правди, не константа
         voice = self._apopup([voice_label(x) for x in VOICES],
                              voice_label(getattr(p, "voice", VOICES[0])), "voiceChanged:")
+        self.voice_pop = voice              # тримаємо посилання: список оновлюється на кожному show()
         srow, self.speed_sl, self.speed_val = self._aslider_row(
             "Швидкість", 0.7, 1.3, getattr(p, "speed", 1.0), "speedChanged:",
             lambda x: f"×{x:.2f}")
@@ -2675,7 +2742,7 @@ class SettingsWindow(NSObject):
             "optKv": bool(cfg.get("ollama_kv_q8", True)),
             "chatsDir": chats_dir(),
             "modelsDir": models_dir(),
-            "voices": [voice_label(x) for x in VOICES],
+            "voices": [voice_label(x) for x in refresh_voices()],
             "voiceIdx": VOICES.index(p.voice) if p.voice in VOICES else 0,
             "speed": float(getattr(p, "speed", 1.0)),
             "volume": float(getattr(p, "volume", 0.85)),
@@ -4450,7 +4517,11 @@ class Panel(rumps.App):
         except Exception: pass
         if "hotkeys" not in cfg:
             cfg["hotkeys"] = DEFAULT_HOTKEYS; save_cfg(cfg)
-        self.voice = cfg.get("voice") if cfg.get("voice") in VOICES else VOICES[0]
+        # 🔴 збережений голос НЕ скидаємо, навіть якщо його нема в поточному списку:
+        # на старті сервер ще може не відповідати (список = фолбек із 4 імен), і
+        # стара логіка мовчки перекидала людину на перший голос, губивши вибір.
+        saved = cfg.get("voice")
+        self.voice = saved if saved else VOICES[0]
         try: self.speed = max(0.7, min(1.3, float(cfg.get("speed", 1.0))))
         except Exception: self.speed = 1.0
         try: self.pause = max(0.0, min(0.6, float(cfg.get("pause", 0.15))))
@@ -4474,6 +4545,9 @@ class Panel(rumps.App):
         self._tts_logpath = os.path.expanduser("~/.local/kobzarai/logs/tts.log")
         self._tts_restart_at = 0.0      # анти-флуд: не рестартувати частіше, ніж раз/15с
         self._oll_was_up = None         # стан Ollama попереднього тіку (детект самопадіння)
+        self._oll_miss = 0              # поспіль промахів ollama_up (дебаунс хибного краху)
+        self._oll_stopped = False       # True = зупинена НАВМИСНО (тогл юзера) → watchdog мовчить
+        self._oll_restart_at = 0.0      # анти-флуд: не рестартувати частіше, ніж раз/30с
         self._settings = None
         self._chat = None
         self.menu = [
@@ -4702,8 +4776,24 @@ class Panel(rumps.App):
         up = ollama_up(); free, swap = mem(); tts = tts_up()
         # детект самопадіння/підняття Ollama (юзер: «лама сама випала, чому?»)
         if self._oll_was_up is not None and up != self._oll_was_up:
-            self._log("Ollama " + ("UP" if up else "DOWN (впала сама)"))
+            self._log("Ollama " + ("UP" if up else
+                      ("DOWN (зупинена тоглом)" if self._oll_stopped else "DOWN (впала сама)")))
         self._oll_was_up = up
+        # WATCHDOG Ollama (дзеркало TTS-watchdog нижче, задача task_20260715_001):
+        # падає сама (OOM на 8ГБ) і без цього лишалась лежати до ручного тоглу,
+        # тоді як TTS сам піднімався — звідси картина «TTS живий, Ollama мовчить».
+        # Рестарт лише якщо: autostart_ollama увімкнено, зупинка НЕ навмисна,
+        # ≥3 промахи поспіль (дебаунс), не частіше 1×/30с (не зациклитись на OOM-флапі).
+        if not up:
+            self._oll_miss += 1
+        else:
+            self._oll_miss = 0
+        if (not up and not self._oll_stopped and self._oll_miss >= 3
+                and load_cfg().get("autostart_ollama")
+                and time.time() - self._oll_restart_at > 30):
+            self._oll_restart_at = time.time()
+            if self._start_ollama():
+                self._log("WATCHDOG: Ollama лежить → рестарт")
         if self._tts_starting and tts:
             self._tts_starting = False; self._tts_unloaded = False
         # WATCHDOG (бег-сейф): сервер БУВ живий, а тепер впав, і це НЕ навмисне
@@ -4836,10 +4926,14 @@ class Panel(rumps.App):
         # прибирає Ollama разом із KobzarAI при кожному перезапуску панелі
         # (TTS-лаунчер це вже робить — тут було пропущено)
         subprocess.Popen(["bash", START_OLLAMA], start_new_session=True)
+        self._oll_stopped = False       # будь-який старт знімає «навмисну зупинку»
         return True
 
     def toggle_ollama(self, _):
-        if ollama_up(): sh("pkill -f 'ollama serve'"); notify("KobzarAI", "Ollama зупинена", "")
+        if ollama_up():
+            # позначити як НАВМИСНУ зупинку, інакше watchdog у refresh() підніме назад
+            self._oll_stopped = True
+            sh("pkill -f 'ollama serve'"); notify("KobzarAI", "Ollama зупинена", "")
         elif self._start_ollama(): notify("KobzarAI", "Ollama запускається…", "")
 
     def unload_models(self, _):

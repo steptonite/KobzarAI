@@ -1,0 +1,416 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>KobzarAI — макет</title>
+<style>
+  :root{
+    --bg:#ECECEE; --win:#F6F6F8; --card:#FFFFFF; --page:#F2F2F4;
+    --txt:#1D1D1F; --txt2:#86868B; --txt3:#AEAEB2;
+    --sep:rgba(0,0,0,.08); --line:rgba(0,0,0,.10);
+    --accent:#007AFF; --green:#34C759; --red:#FF3B30;
+    --field:#FFFFFF; --track:#E3E3E6;
+    --radius:10px;
+  }
+  @media (prefers-color-scheme: dark){
+    :root{
+      --bg:#1C1C1E; --win:#2A2A2C; --card:#2C2C2E; --page:#242426;
+      --txt:#F5F5F7; --txt2:#98989F; --txt3:#6C6C70;
+      --sep:rgba(255,255,255,.08); --line:rgba(255,255,255,.12);
+      --field:#3A3A3C; --track:#48484A;
+    }
+  }
+  *{box-sizing:border-box;margin:0;padding:0;}
+  body{
+    font-family:-apple-system,"SF Pro Text",BlinkMacSystemFont,"Helvetica Neue",sans-serif;
+    background:var(--win); color:var(--txt);
+    height:100vh; overflow:hidden; -webkit-font-smoothing:antialiased;
+  }
+  .win{
+    width:100%; height:100vh; background:var(--win); overflow:hidden;
+    display:flex; flex-direction:column;
+  }
+  /* смуга-сегмент. Вікно fullSizeContent: верхні ~28px = нативна зона світлофора+перетягу
+     (краде кліки) → сегмент тримаємо в НИЗУ смуги, нижче тієї зони. */
+  .titlebar{height:58px; display:flex; align-items:flex-end; justify-content:center;
+    padding-bottom:6px; position:relative; flex:0 0 58px;}
+  .lights{display:flex; gap:8px;}
+  .light{width:12px;height:12px;border-radius:50%;}
+  .l1{background:#FF5F57;} .l2{background:#FEBC2E;} .l3{background:#28C840;}
+
+  /* segmented control */
+  .segwrap{position:relative;}
+  .seg{position:relative; display:flex; background:rgba(120,120,128,.14); border-radius:8px; padding:2px;}
+  .pill{position:absolute; top:2px; left:2px; height:calc(100% - 4px); background:var(--accent);
+    border-radius:6px; box-shadow:0 1px 3px rgba(0,122,255,.32);
+    transition:transform .38s cubic-bezier(.32,1.32,.5,1), width .38s cubic-bezier(.32,1.32,.5,1);}
+  .seg button{position:relative; z-index:1; border:none; background:none; height:24px; padding:0 16px;
+    font-size:13px; color:var(--txt2); cursor:pointer; font-family:inherit; font-weight:400; transition:color .2s;}
+  .seg button.act{color:#fff; font-weight:500;}
+  .seg.sm button{height:22px;padding:0 13px;font-size:12px;}
+
+  .body{padding:18px 22px 26px; flex:1; min-height:0; overflow-y:auto; background:var(--page);}
+  .tab{display:none;} .tab.show{display:block;}
+
+  .grp{font-size:12px; color:var(--txt2); margin:14px 4px 7px; font-weight:400;}
+  .grp:first-child{margin-top:2px;}
+  .card{background:var(--card); border-radius:var(--radius); box-shadow:0 0 0 0.5px var(--line);}
+  .row{display:flex; align-items:center; min-height:44px; padding:7px 14px;}
+  .row + .row{box-shadow:inset 0 0.5px 0 var(--sep);}
+  .row .lbl{flex:1; font-size:13px;}
+  .row .sub{font-size:11px; color:var(--txt2); margin-top:1px;}
+  .hint{font-size:11.5px; color:var(--txt2); margin:6px 6px 0; line-height:1.4;}
+
+  kbd{font-family:ui-monospace,"SF Mono",monospace; font-size:12px; color:var(--txt2);
+    background:rgba(120,120,128,.14); border-radius:5px; margin-right:8px;
+    display:inline-flex; align-items:center; justify-content:center; min-width:56px; height:22px;}
+  .btn{height:24px; padding:0 11px; font-size:12px; font-family:inherit; color:var(--txt);
+    background:var(--card); border:0.5px solid var(--line); border-radius:6px; cursor:pointer;
+    box-shadow:0 1px 1.5px rgba(0,0,0,.05);}
+  .btn:active{background:rgba(0,0,0,.04);}
+  .btn.ic{width:26px;padding:0;display:inline-flex;align-items:center;justify-content:center;}
+  .btn.prim{background:var(--accent); color:#fff; border-color:transparent;}
+  .btn.danger{color:var(--red); border-color:rgba(255,59,48,.4);}
+  .btn.danger:active{background:var(--red); color:#fff; border-color:transparent;}
+  .btn.play:active{background:var(--accent); color:#fff; border-color:transparent;}
+  .btn.trash:active{background:var(--red); color:#fff; border-color:transparent;}
+
+  .sw{width:40px;height:24px;border-radius:13px;background:var(--track);position:relative;cursor:pointer;flex-shrink:0;
+    transition:background .25s cubic-bezier(.4,.2,.2,1); box-shadow:inset 0 0 0 0.5px rgba(0,0,0,.04);}
+  .sw::after{content:"";position:absolute;top:1.5px;left:1.5px;width:21px;height:21px;border-radius:50%;
+    background:linear-gradient(180deg,#fff,#f3f3f3);box-shadow:0 1px 3px rgba(0,0,0,.18),0 0 0 0.5px rgba(0,0,0,.06);
+    transition:transform .25s cubic-bezier(.4,.2,.2,1);}
+  .sw.on{background:var(--green);} .sw.on::after{transform:translateX(16px);}
+
+  .slider{flex:1;display:flex;align-items:center;gap:10px;}
+  .slider input[type=range]{flex:1;}
+  .slider .val{font-size:12px;color:var(--txt2);min-width:42px;text-align:right;}
+
+  select.pop{font-family:inherit;font-size:13px;color:var(--txt);background:var(--field);
+    border:0.5px solid var(--line);border-radius:7px;height:28px;padding:0 26px 0 10px;cursor:pointer;
+    -webkit-appearance:none;appearance:none;
+    background-image:url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="%238E8E93" stroke-width="2.5"><polyline points="6 9 12 15 18 9"/></svg>');
+    background-repeat:no-repeat;background-position:right 8px center;}
+  input.txt{font-family:inherit;font-size:13px;color:var(--txt);background:var(--field);
+    border:0.5px solid var(--line);border-radius:7px;height:28px;padding:0 10px;width:100%;}
+  input.txt:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px rgba(0,122,255,.18);}
+  input[type=range]{-webkit-appearance:none;appearance:none;height:4px;border-radius:2px;cursor:pointer;
+    background:var(--track);}
+  input[type=range].acc{background:linear-gradient(90deg,var(--accent) var(--f,50%),var(--track) var(--f,50%));}
+  input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:21px;height:21px;border-radius:50%;
+    background:radial-gradient(circle at 38% 32%,#ffffff,#ececec 70%);
+    box-shadow:0 0.5px 1px rgba(0,0,0,.12),0 2px 5px rgba(0,0,0,.22),inset 0 0 0 0.5px rgba(0,0,0,.05);cursor:pointer;}
+
+  .stepper{display:inline-flex;align-items:center;background:var(--field);border:0.5px solid var(--line);border-radius:7px;overflow:hidden;height:28px;}
+  .stepper button{width:30px;border:none;background:none;font-size:16px;color:var(--txt);cursor:pointer;font-family:inherit;}
+  .stepper button:active{background:rgba(0,0,0,.06);}
+  .stepper .num{min-width:50px;text-align:center;font-size:13px;border-left:0.5px solid var(--line);border-right:0.5px solid var(--line);height:100%;display:flex;align-items:center;justify-content:center;}
+
+  .ti{font-size:14px;line-height:1;}
+</style>
+<link rel="stylesheet" href="tabler.css">
+</head>
+<body>
+<div class="win">
+  <div class="titlebar">
+    <div class="segwrap">
+      <div class="seg" id="seg">
+        <div class="pill" id="pill"></div>
+        <button class="segb act" data-t="zag">Загальні</button>
+        <button class="segb" data-t="gol">Голос</button>
+        <button class="segb" data-t="mod">Моделі</button>
+        <button class="segb" data-t="chat">Чат</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="body">
+
+    <!-- ЗАГАЛЬНІ -->
+    <div class="tab show" data-tab="zag">
+      <div class="grp">Глобальні хоткеї</div>
+      <div class="card">
+        <div class="row"><span class="lbl">Озвучити виділене</span><kbd id="hk-speak_sel">—</kbd><button class="btn" data-act="hk" data-key="speak_sel">Записати</button></div>
+        <div class="row"><span class="lbl">Озвучити буфер</span><kbd id="hk-speak_clip">—</kbd><button class="btn" data-act="hk" data-key="speak_clip">Записати</button></div>
+        <div class="row"><span class="lbl">Пауза / продовжити</span><kbd id="hk-tts_pause">—</kbd><button class="btn" data-act="hk" data-key="tts_pause">Записати</button></div>
+        <div class="row"><span class="lbl">Стоп</span><kbd id="hk-tts_stop">—</kbd><button class="btn" data-act="hk" data-key="tts_stop">Записати</button></div>
+      </div>
+      <div class="hint">«Записати» → натисни комбо. Esc — скасувати.</div>
+
+      <div class="grp">Вигляд</div>
+      <div class="card">
+        <div class="row"><span class="lbl">Тема</span><select class="pop" id="theme" data-act="theme"><option>Авто</option><option>Світла</option><option>Темна</option></select></div>
+        <div class="row"><span class="lbl" style="flex:0 0 130px">Прозорість фону</span><div class="slider"><input type="range" class="acc" id="transp" data-act="transp" min="0" max="100" value="70" style="--f:70%"><span class="val" id="transp-val">70%</span></div></div>
+      </div>
+
+      <div class="grp">Автозапуск</div>
+      <div class="card">
+        <div class="row"><span class="lbl">Разом із входом у систему</span><span class="sw" data-act="autoLogin"></span></div>
+        <div class="row"><span class="lbl">Ollama</span><span class="sw" data-act="autoOllama"></span></div>
+        <div class="row"><span class="lbl">Озвучення (TTS)</span><span class="sw" data-act="autoTts"></span></div>
+      </div>
+      <div class="hint">Ollama й озвучку — при відкритті панелі.</div>
+
+      <div class="grp">Оптимізація Ollama (8 ГБ)</div>
+      <div class="card">
+        <div class="row"><div style="flex:1"><div class="lbl">Flash Attention</div><div class="sub">швидше, менше RAM на контекст</div></div><span class="sw" data-act="optFlash"></span></div>
+        <div class="row"><div style="flex:1"><div class="lbl">KV-кеш 8-біт</div><div class="sub">~вдвічі менше пам'яті (потребує Flash)</div></div><span class="sw" data-act="optKv"></span></div>
+      </div>
+      <div class="hint">Діє при наступному старті Ollama (СТОП → Старт у меню).</div>
+
+      <div class="grp">Чати</div>
+      <div class="card">
+        <div class="row">
+          <span class="lbl" id="chatsDir" style="font-family:ui-monospace,'SF Mono',monospace;font-size:12px;color:var(--txt2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">~/Documents/KobzarAI/Чати</span>
+          <button class="btn ic" style="margin-right:6px" data-act="chatsFolder"><i class="ti ti-folder"></i></button>
+          <button class="btn" data-act="chatsFinder">Показати у Finder</button>
+        </div>
+      </div>
+      <div class="hint">Кожен чат — окремий .json. Зміна теки стосується подальших чатів.</div>
+
+      <div class="grp" style="color:var(--red)">Небезпечна зона</div>
+      <div class="card">
+        <div class="row">
+          <div style="flex:1"><div class="lbl">Видалити KobzarAI</div><div class="sub">зупинить сервіси й безповоротно зітре застосунок, Ollama-лаунчер і TTS-сервер</div></div>
+          <button class="btn danger" style="height:28px" data-act="uninstall">Видалити…</button>
+        </div>
+      </div>
+      <div class="hint">Моделі на зовнішньому диску НЕ чіпаються.</div>
+    </div>
+
+    <!-- ГОЛОС -->
+    <div class="tab" data-tab="gol">
+      <div class="grp">Озвучення</div>
+      <div class="card">
+        <div class="row"><span class="lbl">Голос моделі</span><select class="pop"><option>Filatov (укр)</option><option>Tymchenko (укр)</option></select></div>
+        <div class="row"><span class="lbl" style="flex:0 0 130px">Швидкість</span><div class="slider"><input type="range" class="acc" min="50" max="200" value="100" style="--f:33%"><span class="val">1.0×</span></div></div>
+        <div class="row"><span class="lbl" style="flex:0 0 130px">Гучність</span><div class="slider"><input type="range" class="acc" min="0" max="100" value="80" style="--f:80%"><span class="val">80%</span></div></div>
+        <div class="row"><span class="lbl" style="flex:0 0 130px">Пауза між реченнями</span><div class="slider"><input type="range" class="acc" min="0" max="100" value="40" style="--f:40%"><span class="val">0.4 с</span></div></div>
+        <div class="row"><span class="lbl">Зразок голосу</span><button class="btn play"><i class="ti ti-player-play" style="vertical-align:-2px;margin-right:4px"></i>Прослухати</button></div>
+      </div>
+
+      <div class="grp">Режим озвучення</div>
+      <div class="card">
+        <div class="row"><div style="flex:1"><div class="lbl">За замовчуванням</div><div class="sub">наживо — одразу · швидко — після 1-го речення · базово — весь текст</div></div>
+          <div class="seg sm" style="position:relative"><div class="pill"></div>
+            <button class="act">Базово</button><button>Швидко</button><button>Наживо</button></div>
+        </div>
+      </div>
+
+      <div class="grp">Оптимізація RAM</div>
+      <div class="card">
+        <div class="row"><div style="flex:1"><div class="lbl">Вивантажувати модель з RAM</div><div class="sub">TTS-сервер лишається, звільняється лише модель (~1.1 ГБ)</div></div>
+          <select class="pop"><option>через 5 хв</option><option>через 2 хв</option><option>через 10 хв</option><option>через 30 хв</option><option>Ніколи</option></select></div>
+      </div>
+      <div class="hint">Перша озвучка після вивантаження довша (cold-load ~15 с).</div>
+
+      <div class="grp">Вивід звуку</div>
+      <div class="card">
+        <div class="row"><span class="lbl">Пристрій виводу</span><select class="pop"><option>Системний за замовч.</option><option>MacBook Air — динаміки</option><option>AirPods</option></select></div>
+      </div>
+      <div class="hint">За замовчуванням — поточний вихід системи.</div>
+    </div>
+
+    <!-- МОДЕЛІ -->
+    <div class="tab" data-tab="mod">
+      <div class="grp">Активна модель</div>
+      <div class="card">
+        <div class="row"><span class="lbl">Модель</span><select class="pop" style="max-width:260px"><option>qwen3:4b-instruct-2507-q4_K_M</option><option>gemma3:1b</option></select></div>
+        <div class="row"><span class="lbl">У RAM зараз</span><span style="font-size:12px;color:var(--txt2)">qwen3:4b · 2.6 ГБ</span></div>
+        <div class="row" style="gap:8px">
+          <button class="btn prim" style="height:28px"><i class="ti ti-download" style="vertical-align:-2px;margin-right:4px"></i>У RAM</button>
+          <button class="btn" style="height:28px">Вивантажити</button>
+          <div style="flex:1"></div>
+          <button class="btn danger" style="height:28px">Видалити</button>
+        </div>
+      </div>
+
+      <div class="grp">Генерація</div>
+      <div class="card">
+        <div class="row"><div style="flex:1"><div class="lbl">Відповідь, токенів</div><div class="sub">довша відповідь — більше RAM і часу</div></div>
+          <div class="stepper"><button>−</button><span class="num">1024</span><button>+</button></div></div>
+      </div>
+
+      <div class="grp">Завантажити нову</div>
+      <div class="card" style="padding:12px 14px">
+        <div style="display:flex;gap:8px;align-items:center">
+          <div style="flex:1;position:relative">
+            <input class="txt" value="qwen3:4b-instruct-2507-q4_K_M">
+            <button class="btn ic" style="position:absolute;right:4px;top:3px;border:none;box-shadow:none;background:none;height:22px"><i class="ti ti-x" style="color:var(--txt3)"></i></button>
+          </div>
+          <button class="btn prim" style="height:28px"><i class="ti ti-download" style="vertical-align:-2px;margin-right:4px"></i>Завантажити</button>
+        </div>
+      </div>
+      <div class="hint">ollama.com/library · hf.co/&lt;repo&gt;:Q4_K_M</div>
+
+      <div class="grp">Бібліотека моделей</div>
+      <div class="card" style="padding:12px 14px">
+        <div style="display:flex;gap:8px;align-items:center;margin-bottom:10px">
+          <div class="seg sm" style="position:relative"><div class="pill"></div>
+            <button class="act">Ollama</button><button>HuggingFace</button></div>
+          <select class="pop" style="height:26px;font-size:12px"><option>Сортувати: розмір ↑</option><option>Сортувати: назва</option><option>Сортувати: завантаження</option></select>
+          <div style="flex:1"></div>
+          <button class="btn ic" style="height:26px"><i class="ti ti-refresh"></i></button>
+        </div>
+        <input class="txt" placeholder="Пошук моделі…" style="margin-bottom:8px">
+        <div style="font-size:13px">
+          <div style="display:flex;padding:6px 4px;box-shadow:inset 0 -0.5px 0 var(--sep)"><span style="flex:1">qwen3:4b-instruct</span><span style="color:var(--txt2);width:70px;text-align:right">2.6 ГБ</span></div>
+          <div style="display:flex;padding:6px 4px;box-shadow:inset 0 -0.5px 0 var(--sep)"><span style="flex:1">gemma3:1b</span><span style="color:var(--txt2);width:70px;text-align:right">815 МБ</span></div>
+          <div style="display:flex;padding:6px 4px"><span style="flex:1">llama3.2:3b</span><span style="color:var(--txt2);width:70px;text-align:right">2.0 ГБ</span></div>
+        </div>
+      </div>
+      <div class="hint">Подвійний клік — у поле «Завантажити». HF → hf.co/repo:Q4_K_M</div>
+
+      <div class="grp">Папка моделей</div>
+      <div class="card">
+        <div class="row">
+          <span class="lbl" style="font-family:ui-monospace,'SF Mono',monospace;font-size:12px;color:var(--txt2)">/Volumes/Apacer 120/ollama-models</span>
+          <button class="btn ic" style="margin-right:6px"><i class="ti ti-folder"></i></button>
+          <button class="btn">Застосувати</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ЧАТ -->
+    <div class="tab" data-tab="chat">
+      <div style="display:flex;height:476px;background:var(--card);border-radius:var(--radius);box-shadow:0 0 0 0.5px var(--line);overflow:hidden">
+        <div style="width:178px;border-right:0.5px solid var(--sep);display:flex;flex-direction:column">
+          <div style="display:flex;gap:6px;padding:10px">
+            <button class="btn" style="flex:1;height:28px"><i class="ti ti-plus" style="vertical-align:-2px;margin-right:3px"></i>Новий чат</button>
+            <button class="btn ic trash" style="height:28px"><i class="ti ti-trash"></i></button>
+          </div>
+          <div style="overflow:auto;padding:2px 8px">
+            <div style="padding:7px 10px;border-radius:7px;background:rgba(0,122,255,.12);margin-bottom:2px">
+              <div style="font-size:13px;font-weight:500;color:var(--txt);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">Python — декоратори</div>
+              <div style="font-size:11px;color:var(--txt2)">14:32</div>
+            </div>
+            <div style="padding:7px 10px;border-radius:7px;margin-bottom:2px">
+              <div style="font-size:13px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">Переклад листа</div>
+              <div style="font-size:11px;color:var(--txt2)">вчора</div>
+            </div>
+            <div style="padding:7px 10px;border-radius:7px">
+              <div style="font-size:13px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">Ідеї для треку</div>
+              <div style="font-size:11px;color:var(--txt2)">18 черв</div>
+            </div>
+          </div>
+        </div>
+
+        <div style="flex:1;display:flex;flex-direction:column;min-width:0">
+          <div style="display:flex;align-items:center;gap:8px;padding:10px 14px;box-shadow:inset 0 -0.5px 0 var(--sep)">
+            <span style="width:7px;height:7px;border-radius:50%;background:var(--green);flex-shrink:0"></span>
+            <span style="flex:1;font-size:13px;color:var(--txt2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0">qwen3:4b-instruct-2507-q4_K_M</span>
+            <span style="font-size:12px;color:var(--txt3);flex-shrink:0">2.6 ГБ</span>
+          </div>
+
+          <div style="flex:1;overflow:auto;padding:16px;display:flex;flex-direction:column;gap:12px">
+            <div style="align-self:flex-end;max-width:78%">
+              <div style="background:var(--accent);color:#fff;padding:8px 13px;border-radius:17px;border-bottom-right-radius:5px;font-size:14px;line-height:1.45">Поясни декоратори в Python коротко</div>
+            </div>
+            <div style="align-self:flex-start;max-width:82%">
+              <div style="background:rgba(120,120,128,.12);padding:8px 13px;border-radius:17px;border-bottom-left-radius:5px;font-size:14px;line-height:1.45">Декоратор — функція, що обгортає іншу й додає поведінку без зміни коду. Пишеться <code style="font-family:ui-monospace,monospace;font-size:12px">@dec</code> над <code style="font-family:ui-monospace,monospace;font-size:12px">def</code>.</div>
+              <div style="display:flex;gap:16px;padding:5px 4px 0">
+                <button class="act-btn"><i class="ti ti-copy"></i>Копіювати</button>
+                <button class="act-btn"><i class="ti ti-volume"></i>Озвучити</button>
+                <button class="act-btn"><i class="ti ti-refresh"></i>Ще раз</button>
+              </div>
+            </div>
+          </div>
+
+          <div style="padding:10px 14px 14px;position:relative">
+            <div style="display:flex;align-items:center;gap:6px;border:0.5px solid var(--line);border-radius:20px;padding:5px 5px 5px 14px;background:var(--field)">
+              <span style="flex:1;font-size:14px;color:var(--txt3)">Запит…  (Enter — надіслати)</span>
+              <button class="spk" id="spk" title="Автоозвучка"><i class="ti ti-volume"></i></button>
+              <button id="send" class="btn prim" title="Надіслати · під час генерації — стоп" style="width:32px;height:32px;border-radius:50%;padding:0;display:flex;align-items:center;justify-content:center"><i class="ti ti-arrow-up" style="font-size:17px"></i></button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<style>
+.act-btn{border:none;background:none;padding:0;font-size:12px;color:var(--txt3);cursor:pointer;font-family:inherit;display:inline-flex;align-items:center;gap:3px;}
+.act-btn:hover{color:var(--accent);}
+/* озвучка = гола іконка-динамік: on=синя, off=сіра, на натиск круглий синій спалах */
+.spk{width:30px;height:30px;border-radius:50%;border:none;background:none;color:var(--accent);cursor:pointer;
+  display:flex;align-items:center;justify-content:center;font-size:16px;-webkit-tap-highlight-color:transparent;
+  transition:color .18s ease, background .2s ease, transform .12s ease;}
+.spk.off{color:var(--txt2);}
+.spk:active{background:rgba(0,122,255,.16); transform:scale(.86);}
+</style>
+<script>
+  var tabs=document.querySelectorAll('.tab'), segMap=[];
+  function initSeg(seg){
+    var pill=seg.querySelector('.pill'), btns=[].slice.call(seg.querySelectorAll('button'));
+    function place(b){ if(!b.offsetWidth) return; pill.style.width=b.offsetWidth+'px'; pill.style.transform='translateX('+(b.offsetLeft-2)+'px)'; }
+    function sel(b){
+      btns.forEach(function(x){x.classList.remove('act');}); b.classList.add('act'); place(b);
+      if(seg.id==='seg'){ tabs.forEach(function(t){t.classList.toggle('show', t.dataset.tab===b.dataset.t);}); setTimeout(function(){segMap.forEach(function(o){o.place();});},0); }
+    }
+    btns.forEach(function(b){b.addEventListener('click',function(){sel(b);});});
+    return function(){ place(seg.querySelector('button.act')||btns[0]); };
+  }
+  document.querySelectorAll('.seg').forEach(function(seg){ var p=initSeg(seg); segMap.push({place:p}); });
+  function placeAll(){ segMap.forEach(function(o){o.place();}); }
+  window.addEventListener('load',placeAll); placeAll();
+
+  var spk=document.getElementById('spk'), on=true;
+  spk.addEventListener('click',function(){on=!on;spk.classList.toggle('off',!on);});
+
+  document.querySelectorAll('.sw').forEach(function(s){s.addEventListener('click',function(){s.classList.toggle('on');});});
+
+  var send=document.getElementById('send'), gen=false;
+  send.addEventListener('click',function(){
+    gen=!gen;
+    if(gen){send.innerHTML='<span style="width:11px;height:11px;background:#fff;border-radius:2px;display:block"></span>';send.style.background='var(--red)';}
+    else{send.innerHTML='<i class="ti ti-arrow-up" style="font-size:17px"></i>';send.style.background='var(--accent)';}
+  });
+
+  document.querySelectorAll('input[type=range].acc').forEach(function(r){
+    function upd(){var p=(r.value-r.min)/(r.max-r.min)*100;r.style.setProperty('--f',p+'%');}
+    r.addEventListener('input',upd);upd();
+  });
+</script>
+
+<!-- ── Python-міст: контроли ↔ бекенд ── -->
+<script>
+  function B(o){ try{ if(window.webkit&&webkit.messageHandlers&&webkit.messageHandlers.ui) webkit.messageHandlers.ui.postMessage(o); }catch(e){} }
+  var S = window.__STATE__ || {};
+
+  // ── застосувати початковий стан до контролів ──
+  function setSel(id,val){ var e=document.getElementById(id); if(!e)return;
+    for(var i=0;i<e.options.length;i++){ if(e.options[i].text===val||e.options[i].value===val){e.selectedIndex=i;return;} } }
+  function setSw(act,on){ var e=document.querySelector('.sw[data-act="'+act+'"]'); if(e)e.classList.toggle('on',!!on); }
+  function setRange(id,valId,v,fmt){ var r=document.getElementById(id); if(!r)return;
+    r.value=v; var p=(r.value-r.min)/(r.max-r.min)*100; r.style.setProperty('--f',p+'%');
+    var s=document.getElementById(valId); if(s)s.textContent=fmt?fmt(v):v; }
+
+  if(S.theme) setSel('theme',S.theme);
+  setSw('autoLogin',S.autoLogin); setSw('autoOllama',S.autoOllama); setSw('autoTts',S.autoTts);
+  setSw('optFlash',S.optFlash); setSw('optKv',S.optKv);
+  if(S.transp!=null) setRange('transp','transp-val',S.transp,function(v){return v+'%';});
+  if(S.chatsDir){ var cd=document.getElementById('chatsDir'); if(cd)cd.textContent=S.chatsDir; }
+  if(S.hotkeys){ for(var k in S.hotkeys){ var e=document.getElementById('hk-'+k); if(e)e.textContent=S.hotkeys[k]||'—'; } }
+
+  // ── слухачі → міст ──
+  var th=document.getElementById('theme'); if(th) th.addEventListener('change',function(){B({a:'theme',v:th.value});});
+  var tr=document.getElementById('transp'); if(tr) tr.addEventListener('input',function(){
+    var s=document.getElementById('transp-val'); if(s)s.textContent=tr.value+'%'; B({a:'transp',v:+tr.value}); });
+  // тумблери: мокапний слухач перемкнув .on ПЕРШИМ, читаємо новий стан
+  document.querySelectorAll('.sw[data-act]').forEach(function(s){
+    s.addEventListener('click',function(){ B({a:s.dataset.act,v:s.classList.contains('on')}); }); });
+  // прості кнопки-дії
+  document.querySelectorAll('button[data-act]').forEach(function(b){
+    b.addEventListener('click',function(){ B({a:b.dataset.act,key:b.dataset.key||''}); }); });
+
+  // ── функції, які Python може викликати (проштовхування оновлень) ──
+  window.kobzar = {
+    setHotkey:function(k,txt){ var e=document.getElementById('hk-'+k); if(e)e.textContent=txt||'—'; },
+    setChatsDir:function(p){ var e=document.getElementById('chatsDir'); if(e)e.textContent=p; }
+  };
+</script>
+</body>
+</html>
