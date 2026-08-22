@@ -160,7 +160,97 @@ def verbalize_ua(t):
 
 
 # --- StyleTTS2 синтез (укр) ---
-def split_to_parts(text, group=True):
+# --- клітики: службові слова, які в українській НЕ несуть наголосу ---
+# Stressifier зі словника б'є акут у КОЖНЕ слово (19 з 21 на типовій фразі) →
+# рівномірний удар по всьому підряд, немає слабких складів, на тлі яких сильні
+# звучали б сильними. Це чується як монотонність/карбування. Знімаємо акут
+# з односкладових службових слів; багатоскладові («тільки», «навіть», «однак»)
+# мають власний наголос і НЕ чіпаються. Двозначні («та», «то») теж не чіпаємо —
+# вони бувають займенниками. Ручний `+` завжди перемагає цей фільтр.
+_ACUTE = StressSymbol.CombiningAcuteAccent
+CLITICS = {
+    # прийменники
+    "в", "у", "з", "зі", "із", "на", "до", "від", "од", "за", "під", "над",
+    "при", "про", "для", "без", "крізь", "повз", "по", "о", "об", "між",
+    # сполучники
+    "і", "й", "а", "чи", "що", "як", "бо", "хоч", "ніж",
+    "щоб", "аби", "але", "коли", "якщо", "хоча", "проте", "адже",
+    # частки
+    "не", "ні", "б", "би", "ж", "же", "аж", "хай", "нехай",
+    # 🔴 «це» — найризикованіше в списку: у потоці («це не так», «це вже»)
+    # воно слабке, але як підмет («Це — головне») наголос потрібен.
+    # Якщо десь з'їсть акцент — став `+` вручну, він сильніший за фільтр.
+    "це",
+}
+
+
+def _manual_stressed(text):
+    """Слова, у яких акут стоїть ВРУЧНУ (з `+`) — їх фільтр не чіпає."""
+    return {w.replace(_ACUTE, "").lower() for w in text.split() if _ACUTE in w}
+
+
+def _unstress_clitics(text, manual=frozenset()):
+    """Прибрати акут зі службових слів, крім наголошених вручну."""
+    out = []
+    for w in text.split(" "):
+        bare = w.replace(_ACUTE, "")
+        key = bare.strip(".,!?:;»«\"()—-").lower()
+        if key in CLITICS and key not in manual:
+            w = bare
+        out.append(w)
+    return " ".join(out)
+
+
+def _split_commas(text, min_chars=14):
+    """Розрізати РЕЧЕННЯ по комах, зберігаючи кому в кінці шматка.
+
+    Кома лишається на місці навмисно: шматок, що закінчується комою, модель
+    веде з незавершеною (неспадною) інтонацією — саме тому не можна різати
+    так, як ріжуться речення (там у кінець дописується крапка = спад).
+    Куски коротші за min_chars зліплюються з сусідом: на огризку в 3-4 склади
+    синтез дає власний холодний старт і чути «сходинку».
+    Вмикається лише коли comma_pause > 0 ⇒ дефолт (Кобзар/Cherry) не зачеплений."""
+    raw = re.split(r"(?<=,)\s+", text)
+    out = []
+    for piece in raw:
+        if out and len(out[-1]) < min_chars:
+            out[-1] += " " + piece
+        else:
+            out.append(piece)
+    if len(out) > 1 and len(out[-1]) < min_chars:
+        # 🔴 НЕ `out[-2] += " " + out.pop()`: індекс цілі рахується ДО обчислення
+        # правої частини, а pop() коротшає список ⇒ на двох шматках запис іде в
+        # неіснуючий -2 (IndexError). Спершу знімаємо хвіст, потім доклеюємо.
+        tail = out.pop()
+        out[-1] += " " + tail
+    return out
+
+
+def _normalize(wav, target_dbfs=-16.0, ceiling_dbfs=-1.0):
+    """Підняти гучність до цільового RMS і придавити піки м'яким лімітером.
+
+    ЧОМУ RMS, а не пік: пікова нормалізація нічого не дає — один клац на -0.1 dB
+    і трек лишається тихим. Соцмережі слухають середню гучність (≈ -14 LUFS),
+    тому тягнемо RMS, а піки згинаємо tanh'ом. Просте масштабування «до піку»
+    після підйому вбило б увесь виграш."""
+    rms = float(np.sqrt(np.mean(np.square(wav))))
+    if rms <= 1e-6:
+        return wav
+    wav = wav * (10.0 ** ((target_dbfs - 20.0 * np.log10(rms)) / 20.0))
+    ceil = 10.0 ** (ceiling_dbfs / 20.0)
+    knee = ceil * 0.7
+    over = np.abs(wav) > knee
+    if over.any():
+        mag = np.abs(wav[over])
+        wav[over] = np.sign(wav[over]) * (knee + (ceil - knee) * np.tanh((mag - knee) / (ceil - knee)))
+    return wav.astype("float32")
+
+
+def split_to_parts(text, group_chars=20):
+    """group_chars — мінімальна довжина накопиченого шматка, перш ніж дозволити
+    розріз на межі речення. Дефолт 20 = поточна поведінка (Cherry без змін).
+    KobzarAI шле більше (~150-220) → довші спани синтезу = менше стиків = менше
+    рваності й природніший інтонаційний контур усередині спана."""
     text = re.sub(r"(\w+[^.,!:?\-])\n", r"\1. ", text)
     text = text.replace("\n", " ")
     split_symbols = ".?!:"
@@ -170,7 +260,7 @@ def split_to_parts(text, group=True):
     for i, s in enumerate(text):
         parts[index] += s
         if s in split_symbols and i < last and text[i + 1] == " ":
-            if group and len(parts[index]) <= 20:
+            if group_chars and len(parts[index]) <= group_chars:
                 continue
             index += 1
             parts.append("")
@@ -215,13 +305,22 @@ def _highpass(wav, cut=65.0):
     return sosfilt(_HP_SOS, wav).astype("float32")
 
 
-def _ua_array(text, kind, style, speed, pause=0.15):
+def _ua_array(text, kind, style, speed, pause=0.15, group_chars=20,
+              comma_pause=0.0, norm_db=None):
     """Синтез укр -> float32 numpy @24k, або None.
-    pause — секунди тиші МІЖ реченнями (керована «дихалка», плавна склейка)."""
+    pause — секунди тиші МІЖ реченнями (керована «дихалка», плавна склейка).
+    group_chars — таргет довжини спана (див. split_to_parts); дефолт 20 = як було.
+    comma_pause — секунди тиші на КОМІ всередині речення; 0 = вимкнено (дефолт).
+    speed — число АБО список чисел по реченнях (останнє значення тягнеться далі):
+        дає сповільнення там, де воно логічне (фінальна думка), без окремих запитів.
+    norm_db — цільовий RMS у dBFS (напр. -16); None = не чіпати гучність."""
     model = get_model(kind)
     sil = np.zeros(int(max(0.0, pause) * SAMPLE_RATE), dtype="float32")
+    csil = np.zeros(int(max(0.0, comma_pause) * SAMPLE_RATE), dtype="float32")
+    speeds = speed if isinstance(speed, (list, tuple)) else [speed]
     result = []
-    for t in split_to_parts(text):
+    for part_i, t in enumerate(split_to_parts(text, group_chars)):
+        sp_speed = float(speeds[min(part_i, len(speeds) - 1)])
         t = t.strip().replace('"', "")
         if not t:
             continue
@@ -232,24 +331,37 @@ def _ua_array(text, kind, style, speed, pause=0.15):
             t += "."
         t = re.sub(r" - ", ": ", t)
         t = verbalize_ua(t)
+        manual = _manual_stressed(t)            # слова, наголошені вручну через `+`
         t = stressify(t)
-        ps = ipa(t)
-        if ps:
+        t = _unstress_clitics(t, manual)        # зняти акут зі службових слів
+        spans = _split_commas(t) if csil.size else [t]
+        first_in_part = True
+        for span in spans:
+            ps = ipa(span)
+            if not ps:
+                continue
             tokens = model.tokenizer.encode(ps)
-            wav = model(tokens, speed=speed, s_prev=style).cpu().numpy().astype("float32")
+            wav = model(tokens, speed=sp_speed, s_prev=style).cpu().numpy().astype("float32")
             wav = _trim_quiet(wav)              # зрізати холодний старт vocoder'а
             wav = _fade_edges(wav)              # згладити краї → без кліку на стику
-            if result and sil.size:
-                result.append(sil)              # тиша лише МІЖ частинами, не на кінці
+            if result:
+                # МІЖ реченнями — pause, МІЖ комами всередині речення — comma_pause
+                gap = sil if first_in_part else csil
+                if gap.size:
+                    result.append(gap)
             result.append(wav)
+            first_in_part = False
     if not result:
         return None
     out = np.concatenate(result).astype("float32")
-    return _highpass(out)                       # DC + суб-бас гул геть
+    out = _highpass(out)                        # DC + суб-бас гул геть
+    return _normalize(out, norm_db) if norm_db is not None else out
 
 
-def synth_ua(text, kind, style, speed, pause=0.15):
-    audio = _ua_array(text, kind, style, speed, pause)
+def synth_ua(text, kind, style, speed, pause=0.15, group_chars=20,
+             comma_pause=0.0, norm_db=None):
+    audio = _ua_array(text, kind, style, speed, pause, group_chars,
+                      comma_pause, norm_db)
     if audio is None:
         return None
     buf = io.BytesIO()
@@ -418,25 +530,46 @@ app = Flask(__name__)
 def speech():
     data = request.get_json(force=True, silent=True) or {}
     text = (data.get("input") or "").strip()
+    raw_speed = data.get("speed", 1.0)
     try:
-        speed = float(data.get("speed", 1.0))
+        # список = різна швидкість по реченнях (фінал повільніше); число = як було
+        if isinstance(raw_speed, (list, tuple)) and raw_speed:
+            speed = [max(0.7, min(1.3, float(v))) for v in raw_speed]
+        else:
+            speed = float(raw_speed)
     except (TypeError, ValueError):
         speed = 1.0
     try:
         pause = float(data.get("pause", 0.15))
     except (TypeError, ValueError):
         pause = 0.15
+    try:
+        group_chars = int(data.get("group_chars", 20))
+    except (TypeError, ValueError):
+        group_chars = 20
+    try:
+        comma_pause = float(data.get("comma_pause", 0.0))
+    except (TypeError, ValueError):
+        comma_pause = 0.0
+    norm_db = data.get("norm_db")
+    try:
+        norm_db = None if norm_db is None else max(-30.0, min(-6.0, float(norm_db)))
+    except (TypeError, ValueError):
+        norm_db = None
     if not text:
         return jsonify({"error": "empty input"}), 400
-    ua_speed = max(0.7, min(1.3, speed))
+    ua_speed = speed if isinstance(speed, list) else max(0.7, min(1.3, speed))
     pause = max(0.0, min(0.6, pause))
+    comma_pause = max(0.0, min(0.4, comma_pause))
+    group_chars = max(10, min(400, group_chars))   # 20=як було (Cherry); KobzarAI шле більше
     # Прибрати markdown -> латиниця в укр-фонетику (g2p) -> вербалізація кирилиці.
     text = strip_markdown(text)
     text = latin_to_ua(text)
     try:
         with _lock:
             kind, style = resolve_voice(data.get("voice"))
-            out = synth_ua(text, kind, style, ua_speed, pause)
+            out = synth_ua(text, kind, style, ua_speed, pause, group_chars,
+                           comma_pause, norm_db)
             if out is None:
                 return jsonify({"error": "nothing to synthesize"}), 400
             mime, audio = out
@@ -465,6 +598,27 @@ def models():
 def health():
     return jsonify({"status": "ok", "engine": "styletts2+edge", "loaded": _loaded["kind"],
                     "voices_multi": len(MULTI_NAMES)})
+
+
+@app.route("/unload", methods=["POST"])
+@app.route("/v1/unload", methods=["POST"])
+def unload():
+    """Звільнити модель з RAM, лишивши Flask живим (idle-вивантаження).
+    Додано для KobzarAI: idle тепер не вбиває сервер, а лише скидає модель —
+    наступний синтез її перевантажить (теплий старт ~секунди, не cold ~20с)."""
+    was = _loaded["kind"]
+    _loaded["kind"] = None
+    _loaded["model"] = None
+    gc.collect()
+    try:
+        if DEVICE == "mps":
+            torch.mps.empty_cache()
+        elif DEVICE == "cuda":
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+    print(f"[styletts] model unloaded (was {was}); server stays up.", flush=True)
+    return jsonify({"status": "unloaded", "was": was})
 
 
 if __name__ == "__main__":
