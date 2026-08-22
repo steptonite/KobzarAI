@@ -366,6 +366,18 @@ def discover_indexes(extra_dirs=None):
         os.path.join(home, ".claude", "tools", "librarian", "index.db"),
         os.path.join(home, "Documents", "KobzarAI", "knowledge", "index.db"),
     ]
+    # 🔴 Second Brain Kit кладе індекс у <вольт>/.index/index.db, а вольт у людей
+    # лежить по-різному. Без цих кандидатів панель не бачила індекс кіта взагалі:
+    # список «готових» лишався порожнім, і книжечка в чаті вела в налаштування,
+    # де не було чого обрати. LIBRARIAN_DB_PATH — та сама змінна, якою кіт
+    # перевизначає шлях, тому вона тут головна.
+    env_db = os.environ.get("LIBRARIAN_DB_PATH", "").strip()
+    if env_db:
+        cands.append(os.path.expanduser(env_db))
+    for vault in ("SecondBrain", os.path.join("Documents", "SecondBrain"),
+                  os.path.join("Documents", "Second Brain")):
+        cands.append(os.path.join(home, vault, ".index", "index.db"))
+        cands.append(os.path.join(home, vault, "index.db"))
     dirs = list(extra_dirs or [])
     for d in dirs:
         try:
