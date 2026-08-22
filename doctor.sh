@@ -75,9 +75,16 @@ fi
 
 if [ -d "$REPO/.git" ]; then
   BEHIND="$(git -C "$REPO" rev-list --count HEAD..@{u} 2>/dev/null || echo "?")"
+  AHEAD="$(git -C "$REPO" rev-list --count @{u}..HEAD 2>/dev/null || echo "?")"
   if [ "$BEHIND" = "?" ]; then warn "гілка не має upstream — оновлення git-ом не перевірити"
-  elif [ "$BEHIND" = "0" ]; then ok "репо на рівні з origin"
-  else warn "репо відстає від origin на $BEHIND комітів → git pull && ./setup.sh"; fi
+  elif [ "$BEHIND" != "0" ]; then warn "репо відстає від origin на $BEHIND комітів → git pull && ./setup.sh"
+  else ok "оновлень з origin немає"; fi
+  # 22.08.2026: «на рівні з origin» друкувалось і тоді, коли локально висіли
+  # незапушені коміти — тобто перевірка мовчки ховала роботу, яка є лише на цій
+  # машині. Перевірка, що не бачить половини стану, гірша за відсутню.
+  if [ "$AHEAD" != "?" ] && [ "$AHEAD" != "0" ]; then
+    warn "локально $AHEAD незапушених комітів — вони існують ТІЛЬКИ на цій машині"
+  fi
 fi
 
 # ── 3. Ollama ─────────────────────────────────────────────────────────
