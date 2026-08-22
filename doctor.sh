@@ -163,8 +163,18 @@ PY
 )"
     [ -z "$T_MISSING" ] && ok "залежності TTS на місці" || bad "у TTS немає: $T_MISSING"
   fi
-  if curl -sf --max-time 3 http://localhost:5050/ >/dev/null 2>&1; then ok "TTS-сервер відповідає на 5050"
-  else warn "TTS-сервер не запущений (нормально, якщо не піднімав)"; fi
+  # 🔴 22.08.2026: била в корінь `/`, якого в сервері НЕМА — curl -f бачив 404 і
+  #    звітував «не запущений» про ЖИВИЙ сервер із 31 голосом. Датчик, що бреше,
+  #    гірший за відсутній: він відводить від справжньої причини. Б'ємо в /health.
+  TTS_H="$(curl -s --max-time 3 http://localhost:5050/health 2>/dev/null || true)"
+  if printf '%s' "$TTS_H" | grep -q '"status"[[:space:]]*:[[:space:]]*"ok"'; then
+    TTS_V="$(printf '%s' "$TTS_H" | python3 -c "import json,sys;print(json.load(sys.stdin).get('voices_multi','?'))" 2>/dev/null || echo '?')"
+    ok "TTS-сервер відповідає на 5050 (голосів: $TTS_V)"
+  elif [ -n "$TTS_H" ]; then
+    bad "на 5050 щось слухає, але це не наш TTS (/health не дав status=ok)"
+  else
+    warn "TTS-сервер не запущений (нормально, якщо не піднімав)"
+  fi
 fi
 
 # ── 5. Чужі шляхи й персональні дані ──────────────────────────────────
