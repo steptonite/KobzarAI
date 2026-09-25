@@ -17,6 +17,11 @@ bge-m3 (її KobzarAI і так вміє тягнути). Ембед-модел�
 """
 import os, json, time, sqlite3, struct, urllib.request, urllib.error
 
+try:
+    import thermal as _thermal          # термо-гейт (пауза при перегріві SoC); портативно
+except Exception:
+    _thermal = None                     # нема модуля/сенсорів → гейт тихо вимкнено
+
 EMBED_MODEL = "bge-m3"
 DIM = 1024
 EXTS = (".md", ".markdown", ".txt", ".text")
@@ -123,6 +128,31 @@ def _chunk(text):
     return chunks
 
 
+class _Cooler:
+    """Троттлений термо-гейт для циклу індексації. Перевіряє температуру не частіше
+    ніж раз на min_gap секунд (щоб не смикати IOHID на кожен батч), і якщо SoC гарячий —
+    БЛОКУЄ потік до охолодження (пауза, не обрив). Портативно: без thermal — no-op."""
+
+    def __init__(self, on_wait=None, min_gap=5.0):
+        self.on_wait = on_wait
+        self.min_gap = min_gap
+        self._last = 0.0
+
+    def tick(self):
+        if _thermal is None:
+            return
+        now = time.time()
+        if now - self._last < self.min_gap:
+            return
+        self._last = now
+        try:
+            waited, _peak = _thermal.cooldown(on_wait=self.on_wait)
+            if waited > 0:
+                self._last = time.time()   # після паузи відлік з нуля
+        except Exception:
+            pass
+
+
 class KB:
     def __init__(self, db_path, host="127.0.0.1:11434"):
         self.db_path = db_path
@@ -149,7 +179,7 @@ class KB:
         row = self._db.execute("SELECT v FROM meta WHERE k=?", (k,)).fetchone()
         return row[0] if row else default
 
-    def index(self, folder, progress=None):
+    def index(self, folder, progress=None, cooldown_cb=None):
         """Інкрементно індексує теку. Незмінені файли (за mtime) пропускає,
         зниклі — прибирає. progress(done, total, phase)."""
         folder = os.path.abspath(os.path.expanduser(folder))
@@ -179,7 +209,9 @@ class KB:
         self._db.commit()
         total = len(found)
         changed = 0
+        cooler = _Cooler(on_wait=cooldown_cb)          # термо-гейт: пауза при перегріві
         for i, fp in enumerate(found):
+            cooler.tick()
             if progress:
                 progress(i, total, "index")
             try:
@@ -197,6 +229,7 @@ class KB:
             pieces = _chunk(text)
             self._db.execute("DELETE FROM chunks WHERE path=?", (fp,))
             for b in range(0, len(pieces), BATCH):
+                cooler.tick()                          # великий файл: гейт і між батчами
                 batch = pieces[b:b + BATCH]
                 vecs = _embed(batch, self.host)
                 for j, (piece, vec) in enumerate(zip(batch, vecs)):

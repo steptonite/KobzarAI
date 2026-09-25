@@ -59,7 +59,7 @@ fi
 # ── 2. Файли панелі й розбіжність із репо ─────────────────────────────
 head_ "2. Що саме встановлено (а не що мало бути)"
 DRIFT=0
-for f in panel.py kb.py make_icon.py; do
+for f in panel.py kb.py thermal.py make_icon.py; do
   if [ ! -f "$PANEL_DIR/$f" ]; then
     bad "$f відсутній у $PANEL_DIR"; DRIFT=1
   elif ! cmp -s "$REPO/panel/$f" "$PANEL_DIR/$f"; then
@@ -68,7 +68,7 @@ for f in panel.py kb.py make_icon.py; do
 done
 [ "$DRIFT" = 0 ] && ok "файли панелі збігаються з репо"
 if [ "$DRIFT" = 1 ] && [ "$FIX" = 1 ]; then
-  cp "$REPO/panel/panel.py" "$REPO/panel/kb.py" "$REPO/panel/make_icon.py" "$PANEL_DIR/" 2>/dev/null \
+  cp "$REPO/panel/panel.py" "$REPO/panel/kb.py" "$REPO/panel/thermal.py" "$REPO/panel/make_icon.py" "$PANEL_DIR/" 2>/dev/null \
     && rm -rf "$PANEL_DIR/ui" && cp -R "$REPO/panel/ui" "$PANEL_DIR/ui" \
     && fixed "файли панелі перезаписано з репо (перезапусти KobzarAI.app)"
 fi

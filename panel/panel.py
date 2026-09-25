@@ -954,6 +954,7 @@ except Exception:
 THEMES = ["Авто", "Світла", "Темна"]
 TOKEN_OPTS = ["512", "1024", "2048", "4096"]
 CTX_OPTS = ["2048", "4096", "8192", "16384"]   # розмір контекстного вікна (num_ctx)
+THERM_OPTS = [85, 88, 90, 92, 95, 98, 100, 103, 105]   # поріг термо-паузи, °C
 # імена message-хендлерів webview-налаштувань (міст HTML→Python). Розширюється стадіями.
 SETTINGS_MSGS = ["ui"]
 
@@ -2421,6 +2422,15 @@ class SettingsWindow(NSObject):
         opt = self._section("Оптимізація Ollama (8 ГБ)", [
             self._arow(self._titled("Flash Attention", "швидше, менше RAM на контекст"), self.opt_flash),
             self._arow(self._titled("KV-кеш 8-біт", "~вдвічі менше памʼяті (потребує Flash)"), self.opt_kv)])
+        # — Термозахист (thermal.py читає config щоразу → діє одразу, і для Кобзаря, і для бібліотекаря) —
+        self.th_on = self._aswitch(cfg.get("thermal_on", True), "thermOnToggled:")
+        self.th_now = self._albl(self._therm_now_txt(), gray=True)
+        therm = self._section("Термозахист", [
+            self._arow(self._titled("Пауза при перегріві",
+                                    "ембед і пошук чекають, поки Mac охолоне — у треї ❄️"), self.th_on),
+            self._arow(self._titled("Поріг паузи",
+                                    "продовження на 8° нижче · Air без кулера 90–92, Pro 100+"), self._atherm()),
+            self._arow("Температура SoC зараз", self.th_now)])
         # — Чати —
         self.chats_field = self._afield("")             # редаговане поле — як Папка моделей
         self.chats_field.setStringValue_(chats_dir())
@@ -2469,6 +2479,7 @@ class SettingsWindow(NSObject):
             self._group(look),
             self._group(auto, "Ollama та голос стартують самі при відкритті застосунку."),
             self._group(opt, "Діє при наступному старті Ollama (СТОП → Старт у меню)."),
+            self._group(therm, "Вимкни на Mac з активним кулером (MacBook Pro), якщо не треба."),
             self._group(chats, "Кожен чат — окремий .json. Зміна теки стосується подальших."),
             self._group(kb_sec, "Локальний семантичний пошук по обраній теці (Ollama bge-m3). "
                                 "Тумблер «книжки» у полі чату вмикає використання."),
@@ -2605,6 +2616,43 @@ class SettingsWindow(NSObject):
         return box
 
     @objc.python_method
+    def _atherm(self):
+        """Степер ± порогу термо-паузи (°C) — та сама плашка, що «Відповідь, токенів»."""
+        cur = int(load_cfg().get("thermal_cool_at", 92))
+        self.th_idx = min(range(len(THERM_OPTS)), key=lambda i: abs(THERM_OPTS[i] - cur))
+        box = self._al(NSBox.alloc().init())
+        box.setBoxType_(4); box.setTitlePosition_(0); box.setCornerRadius_(7.0)
+        box.setBorderWidth_(1.0); box.setBorderColor_(NSColor.separatorColor())
+        box.setFillColor_(self._card_tint()); self._cards.append(box)
+        box.setContentViewMargins_(NSMakeSize(0, 0))
+        minus = self._mk_step("−", -1, "thermStep:"); plus = self._mk_step("+", 1, "thermStep:")
+        self.th_num = self._albl("%d°C" % THERM_OPTS[self.th_idx]); self.th_num.setAlignment_(2)
+        self.th_num.widthAnchor().constraintEqualToConstant_(52).setActive_(True)
+        h = self._hstack(0)
+        for w in (minus, self.th_num, plus): h.addArrangedSubview_(w)
+        box.setContentView_(h); self._fillx(h, box)
+        h.topAnchor().constraintEqualToAnchor_(box.topAnchor()).setActive_(True)
+        h.bottomAnchor().constraintEqualToAnchor_(box.bottomAnchor()).setActive_(True)
+        box.heightAnchor().constraintEqualToConstant_(28).setActive_(True)
+        box.widthAnchor().constraintEqualToConstant_(124).setActive_(True)
+        return box
+
+    @objc.python_method
+    def _therm_now_txt(self):
+        try:
+            import thermal as _th
+            t = _th.read_max()
+        except Exception:
+            t = None
+        if t is None:
+            return "датчик недоступний — пауза не спрацює"
+        cfg = load_cfg()
+        if not cfg.get("thermal_on", True):
+            return "%.0f°C · захист вимкнено" % t
+        ca = int(cfg.get("thermal_cool_at", 92))
+        return "%.0f°C · пауза з %d°C" % (t, ca) + ("  🔥" if t >= ca else "")
+
+    @objc.python_method
     def _actx(self):
         """Степер ± «Контекст, токенів» (num_ctx) — скільки тексту модель «памʼятає»
         за раз. Крокає по CTX_OPTS; стан → self.ctx_idx, cfg num_ctx."""
@@ -2635,23 +2683,36 @@ class SettingsWindow(NSObject):
         self.model_pop.setTarget_(self); self.model_pop.setAction_("modelChanged:")
         self.model_pop.setFocusRingType_(1)
         self.model_pop.widthAnchor().constraintGreaterThanOrEqualToConstant_(220).setActive_(True)
-        self.loaded_lbl = self._albl("—", gray=True)
-        # довгий HF-шлях НЕ має з'їдати лейбл «У RAM зараз» — хай обрізається сам
-        try: self.loaded_lbl.cell().setLineBreakMode_(5)   # TruncatingMiddle
-        except Exception: pass
-        self.loaded_lbl.setContentCompressionResistancePriority_forOrientation_(
-            100, NSUserInterfaceLayoutOrientationHorizontal)
+        # ── два РІВНОЦІННІ слоти RAM (Ollama MAX_LOADED=2: будь-які дві моделі, що влазять) ──
+        # слот 2 з'являється, лише коли слот 1 зайнятий; кожен вивантажується окремо
+        self.slot_name, self.slot_sub, self.slot_btn, self.slot_row = [], [], [], []
+        self._slot_models = ["", ""]
+        slot_rows = []
+        for i in range(2):
+            nm = self._albl("—")
+            try: nm.cell().setLineBreakMode_(5)            # довгий HF-шлях обрізається посередині
+            except Exception: pass
+            sub = self._albl("слот %d · вільний" % (i + 1), gray=True, size=11.0)
+            v = self._vstack(1); v.addArrangedSubview_(nm); v.addArrangedSubview_(sub)
+            b = self._abtn("Вивантажити", "unloadSlot:", symbol="eject")
+            b.setTag_(i)
+            row = self._arow(v, b)
+            nm.setContentCompressionResistancePriority_forOrientation_(
+                1, NSUserInterfaceLayoutOrientationHorizontal)
+            self.slot_name.append(nm); self.slot_sub.append(sub)
+            self.slot_btn.append(b); self.slot_row.append(row); slot_rows.append(row)
+        self.loaded_lbl = self.slot_name[0]               # сумісність: «вкладка Моделі збудована»
         self.load_btn = self._abtn("У RAM", "loadModel:", symbol="arrow.down.circle")
-        unload = self._abtn("Вивантажити", "unloadModel:")
         delete = self._abtn("Видалити", "deleteModel:", danger=True)
         active = self._section("Активна модель", [
             self._arow("Модель", self.model_pop),
-            self._arow("У RAM зараз", self.loaded_lbl),
-            self._arow(self._hstack_pair(self.load_btn, unload), delete)])
-        # КРИТИЧНО: _arow підняв резистанс до 751 → довга назва тисла лівий лейбл.
-        # Опускаємо ПІСЛЯ збірки → обрізаються самі (loaded_lbl + назва моделі в popup).
-        self.loaded_lbl.setContentCompressionResistancePriority_forOrientation_(
-            1, NSUserInterfaceLayoutOrientationHorizontal)
+            self._arow(self.load_btn, delete)] + slot_rows)
+        # лінія-роздільник над слотом 2 ховається разом із ним
+        try:
+            sibs = list(self.slot_row[1].superview().arrangedSubviews())
+            self._slot2_sep = sibs[sibs.index(self.slot_row[1]) - 1]
+        except Exception:
+            self._slot2_sep = None
         self.model_pop.setContentCompressionResistancePriority_forOrientation_(
             1, NSUserInterfaceLayoutOrientationHorizontal)
         try: self.model_pop.cell().setLineBreakMode_(5)   # TruncatingMiddle
@@ -2798,6 +2859,15 @@ class SettingsWindow(NSObject):
             loaded_txt = nm + (f"  ·  {sz}" if sz else "")
         ms = list_models()
         sel = self.sel_model if self.sel_model in ms else (pick_chat_model(ms) if ms else None)
+        # термозахист: поточна температура — щоб людина бачила, від чого її береже тумблер
+        try:
+            import thermal as _th
+            _t = _th.read_max()
+        except Exception:
+            _t = None
+        thermal_now = ("Зараз: %.0f°C · пошук та індексація чекають, поки Mac охолоне" % _t
+                       if _t is not None else
+                       "Датчик температури недоступний на цьому Mac — пауза не спрацює")
         return {
             "theme": cfg.get("theme", "Авто"),
             "transp": int(cfg.get("transp", 70)),
@@ -2806,6 +2876,9 @@ class SettingsWindow(NSObject):
             "autoTts": bool(cfg.get("autostart_tts")),
             "optFlash": bool(cfg.get("ollama_flash", True)),
             "optKv": bool(cfg.get("ollama_kv_q8", True)),
+            "thermalOn": bool(cfg.get("thermal_on", True)),
+            "thermalCool": int(cfg.get("thermal_cool_at", 92)),
+            "thermalNow": thermal_now,
             "chatsDir": chats_dir(),
             "modelsDir": models_dir(),
             "voices": [voice_label(x) for x in refresh_voices()],
@@ -2876,6 +2949,15 @@ class SettingsWindow(NSObject):
         elif a == "autoTts":    cfg["autostart_tts"] = bool(v); save_cfg(cfg)
         elif a == "optFlash":   cfg["ollama_flash"] = bool(v); save_cfg(cfg)
         elif a == "optKv":      cfg["ollama_kv_q8"] = bool(v); save_cfg(cfg)
+        # термозахист: thermal.py читає config щоразу → діє одразу, без перезапуску
+        # (і для Кобзаря, і для бібліотекаря Січі — у них спільний thermal.py)
+        elif a == "thermalOn":  cfg["thermal_on"] = bool(v); save_cfg(cfg)
+        elif a == "thermalCool":
+            try: iv = max(80, min(105, int(v)))
+            except Exception: iv = 92
+            cfg["thermal_cool_at"] = iv
+            cfg["thermal_resume_at"] = iv - 8    # продовжуємо на 8° нижче — щоб не смикало туди-сюди
+            save_cfg(cfg)
         elif a == "chatsFinder": self.revealChatsDir_(None)
         elif a == "chatsFolder":
             p = NSOpenPanel.openPanel()
@@ -3094,10 +3176,33 @@ class SettingsWindow(NSObject):
             return ""
         try:
             import kb as _kbmod
+            self._kb_chat_cool()
             hits = kb.search(query, k=6)
             return _kbmod.build_context(hits)
         except Exception:
             return ""
+
+    @objc.python_method
+    def _kb_chat_cool(self):
+        """Легкий термо-гейт перед пошуком у чаті (фоновий потік): лише аварійно, ≥100°C,
+        не довше 8 с — щоб не морозити відповідь. Якщо пауза сталася — ЧЕСНО кажемо в чаті,
+        а не мовчки висимо. Вимкнено тумблером / нема датчика → миттєво далі."""
+        try:
+            import thermal as _th
+        except Exception:
+            return
+        shown = []
+
+        def _wait(t, waited):
+            if not shown:
+                shown.append(1)
+                self._js("note(%s)" % json.dumps(
+                    "❄️ Mac перегрівся (%.0f°C) — пошук у базі на паузі кілька секунд, "
+                    "щоб охолонути. Відповідь продовжиться сама." % t))
+        try:
+            _th.cooldown(cool_at=100, resume_at=95, max_cool=8, interval=2, on_wait=_wait)
+        except Exception:
+            pass
 
     def kbToggled_(self, sender):
         if not (self.kb_index or self.kb_folder):
@@ -3119,6 +3224,7 @@ class SettingsWindow(NSObject):
             b.setToolTip_("База знань: увімкнено (%s)" % src if self.kb_on
                           else "База знань: вимкнено")
         except Exception: pass
+        self._refresh_chat_header()        # тумблер бази → шапка одразу каже «🔎 bge-m3 →» або ні
 
     @objc.python_method
     def _kb_reindex(self, done=None):
@@ -3143,13 +3249,37 @@ class SettingsWindow(NSObject):
                         time.sleep(1)
                 if not ollama_up():
                     raise _kbmod.KBEmbedUnavailable("Ollama не запущена")
-                stats = kb.index(folder)
+                def _prog(done, total, phase):
+                    AppHelper.callAfter(self._kb_prog, done, total, phase)
+                def _cool(temp, waited):
+                    AppHelper.callAfter(self._kb_cool, temp, waited)
+                stats = kb.index(folder, progress=_prog, cooldown_cb=_cool)
             except Exception as e:
                 err = str(e)
             finally:
                 self._kb_busy = False
                 if done: AppHelper.callAfter(done, stats, err)
         threading.Thread(target=run, daemon=True).start()
+
+    @objc.python_method
+    def _kb_prog(self, done, total, phase):
+        """Прогрес індексації у рядок стану «База знань» (головний потік)."""
+        lbl = getattr(self, "kb_status", None)
+        if lbl is None:
+            return
+        if phase == "done":
+            lbl.setStringValue_(self._kb_status_text())
+        elif total:
+            lbl.setStringValue_("Індексація… %d/%d файлів" % (done, total))
+
+    @objc.python_method
+    def _kb_cool(self, temp, waited):
+        """Термо-пауза під час індексації — показуємо чесно, що це пауза, не обрив."""
+        lbl = getattr(self, "kb_status", None)
+        if lbl is None:
+            return
+        lbl.setStringValue_("❄️ Охолодження SoC %.0f°C — пауза %.0f с (індексація продовжиться)"
+                            % (temp, waited))
 
     @objc.python_method
     def _spkbtn(self, view, x, y, d):
@@ -3338,6 +3468,21 @@ class SettingsWindow(NSObject):
 
     def optKvToggled_(self, sender):
         cfg = load_cfg(); cfg["ollama_kv_q8"] = bool(sender.state()); save_cfg(cfg)
+
+    def thermOnToggled_(self, sender):
+        cfg = load_cfg(); cfg["thermal_on"] = bool(sender.state()); save_cfg(cfg)
+        if getattr(self, "th_now", None) is not None: self.th_now.setStringValue_(self._therm_now_txt())
+
+    def thermStep_(self, sender):
+        i = max(0, min(len(THERM_OPTS) - 1, self.th_idx + int(sender.tag())))
+        if i == self.th_idx: return
+        self.th_idx = i
+        self.th_num.setStringValue_("%d°C" % THERM_OPTS[i])
+        cfg = load_cfg()
+        cfg["thermal_cool_at"] = THERM_OPTS[i]
+        cfg["thermal_resume_at"] = THERM_OPTS[i] - 8    # на 8° нижче — щоб не смикало туди-сюди
+        save_cfg(cfg)
+        if getattr(self, "th_now", None) is not None: self.th_now.setStringValue_(self._therm_now_txt())
 
     def ttsModeChanged_(self, sender):
         # 0=Базовий (стабільний) · 1=Стрім (конвеєр) · 2=Реалтайм (чат озвучує поки пише)
@@ -3643,6 +3788,9 @@ rm -f "$0"
 
     def loadModel_(self, sender):  self.panel.load_model(self.sel_model)
     def unloadModel_(self, sender): self.panel.unload_one(self.sel_model)
+    def unloadSlot_(self, sender):
+        i = int(sender.tag())
+        if 0 <= i < 2 and self._slot_models[i]: self.panel.unload_one(self._slot_models[i])
     def deleteModel_(self, sender): self.panel.delete_model(self.sel_model)
 
     def doPull_(self, sender):
@@ -3934,14 +4082,21 @@ rm -f "$0"
     def _update_loaded(self):
         if self.loaded_lbl is None: return
         loaded = ps_loaded()
-        cur_loaded = ""
-        if loaded:
-            name = loaded[0].split("  ")[0].strip()
-            sz = ram_size(loaded[0])
-            cur_loaded = name
-            self.loaded_lbl.setStringValue_(f"{name}" + (f"  ·  {sz}" if sz else ""))
-        else:
-            self.loaded_lbl.setStringValue_("—  (RAM вільна)")
+        names = [ln.split()[0] for ln in loaded][:2]
+        cur_loaded = self.sel_model if self.sel_model in names else (names[0] if names else "")
+        for i in range(2):
+            ln = loaded[i] if i < len(loaded) else ""
+            nm = names[i] if i < len(names) else ""
+            self._slot_models[i] = nm
+            self.slot_name[i].setStringValue_(nm or "—  вільний")
+            sz = ram_size(ln) if ln else ""
+            self.slot_sub[i].setStringValue_("слот %d" % (i + 1) + (f" · {sz} у RAM" if sz else " · вільний"))
+            self.slot_btn[i].setEnabled_(bool(nm))
+        show2 = bool(names)                                # слот 2 — лише коли слот 1 зайнятий
+        self.slot_row[1].setHidden_(not show2)
+        if self._slot2_sep is not None: self._slot2_sep.setHidden_(not show2)
+        if getattr(self, "th_now", None) is not None:      # темп. SoC живе поруч з оновленням RAM
+            self.th_now.setStringValue_(self._therm_now_txt())
         # «У RAM» горить акцентом лише коли є що вантажити (модель обрана й ще не в RAM);
         # інакше — тухне в дефолт
         if self.load_btn is not None:
@@ -3977,7 +4132,12 @@ rm -f "$0"
         loaded = m in [r.split()[0] for r in ps_loaded()]
         # чесний статус: зелена крапка = модель у RAM зараз; сіра = сервер живий,
         # модель підвантажиться на першому запиті (не брешемо що вже «працює»)
-        self.chat_model_lbl.setStringValue_(m if loaded else m + "  · не в RAM")
+        base = m if loaded else m + "  · не в RAM"
+        rag = getattr(self, "kb_on", False) and bool(      # kb_* живуть у SettingsWindow, не в Panel
+            getattr(self, "kb_index", None) or getattr(self, "kb_folder", None))
+        if rag:                                   # База знань увімк → чесно: пошук bge-m3, відповідь чат-моделлю
+            base = "🔎 bge-m3 → " + base          # кінець «мовчазної підміни ембеда на гему»
+        self.chat_model_lbl.setStringValue_(base)
         if size_lbl is not None:
             size_lbl.setStringValue_(model_size(m))
         self._set_dot(loaded)
@@ -4387,6 +4547,7 @@ rm -f "$0"
             kb = self._kb_get()
             if kb is None:
                 self._js("aiEnd()"); self._js("note('база знань недоступна')"); return
+            self._kb_chat_cool()
             hits = kb.search(last_user, k=6)
             if not hits:
                 full = "Нічого не знайшов у базі знань за цим запитом."
@@ -4616,8 +4777,9 @@ class Panel(rumps.App):
         self._oll_restart_at = 0.0      # анти-флуд: не рестартувати частіше, ніж раз/30с
         self._settings = None
         self._chat = None
+        self._cooling = None            # стан термо-паузи з thermal.py (будь-який процес) → трей
         self.menu = [
-            "mem_line",
+            "mem_line", "thermal_line",
             rumps.MenuItem("Модель у RAM:"), "loaded_line", None,
             "hdr_voice",
             "speak_sel", "speak_clip", "tts_pause", "tts_stop", None,
@@ -4630,6 +4792,8 @@ class Panel(rumps.App):
         # (неклікабельний), сховано доти, доки причина не настане (керується у refresh).
         self.menu["ollama_reason"].title = ""
         self.menu["ollama_reason"]._menuitem.setHidden_(True)
+        self.menu["thermal_line"].title = ""
+        self.menu["thermal_line"]._menuitem.setHidden_(True)   # видно лише під час термо-паузи
         self._sym_cache = {}  # кеш SF Symbol-іконок меню (template, під колір тексту меню)
         # секційні заголовки — нативний стиль: жирний дрібний напис вторинним кольором,
         # без callback (сірий/неклікабельний). Без ASCII-рамки «— … —».
@@ -4822,6 +4986,7 @@ class Panel(rumps.App):
             if self._state == "synth":     name, tint = ("pause.fill" if self._pause_pending else "hourglass"), True
             elif self._state == "playing": name, tint = "waveform", True
             elif self._state == "paused":  name, tint = "pause.fill", True
+            elif self._cooling:            name, tint = "thermometer.snowflake", True
             else:
                 name = "cpu.fill" if up else "cpu"
                 tint = tts
@@ -4830,7 +4995,8 @@ class Panel(rumps.App):
             if not img:
                 return
             if tint:
-                c = NSImageSymbolConfiguration.configurationWithHierarchicalColor_(NSColor.systemOrangeColor())
+                c = NSImageSymbolConfiguration.configurationWithHierarchicalColor_(
+                    NSColor.systemCyanColor() if name == "thermometer.snowflake" else NSColor.systemOrangeColor())
                 img = img.imageWithSymbolConfiguration_(c) or img
                 img.setTemplate_(False)
             else:
@@ -4926,6 +5092,18 @@ class Panel(rumps.App):
         if (self._tts_active == 0 and self._state == "playing"
                 and self._snd is not None and not self._snd.isPlaying()):
             self._state = "idle"; self._snd = None
+        self._cooling = None
+        try:
+            import thermal as _th
+            self._cooling = _th.pause_state()
+        except Exception: pass
+        tl = self.menu["thermal_line"]
+        if self._cooling:
+            c = self._cooling
+            tl.title = "Охолодження: %s на паузі · %.0f°C → %.0f°C" % (
+                c.get("who", "ембед"), c.get("t", 0), c.get("ra", 0))
+            self._set_menu_sym(tl, "thermometer.snowflake")
+        tl._menuitem.setHidden_(not self._cooling)
         self._set_icon(up, tts)
         hk = load_cfg().get("hotkeys", {})
         def _ch(act):

@@ -8,3 +8,4 @@ __pycache__/
 config.json
 voices/
 bench/results/
+.DS_Store

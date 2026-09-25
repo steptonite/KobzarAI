@@ -159,6 +159,13 @@
       </div>
       <div class="hint">Діє при наступному старті Ollama (СТОП → Старт у меню).</div>
 
+      <div class="grp">Термозахист</div>
+      <div class="card">
+        <div class="row"><div style="flex:1"><div class="lbl">Пауза при перегріві</div><div class="sub" id="thermalNow">пошук та індексація чекають, поки Mac охолоне, — нічого не обривається</div></div><span class="sw" data-act="thermalOn"></span></div>
+        <div class="row"><span class="lbl" style="flex:0 0 130px">Поріг паузи</span><div class="slider"><input type="range" class="acc" id="thermalCool" min="80" max="105" value="92" style="--f:48%"><span class="val" id="thermalCool-val">92°C</span></div></div>
+      </div>
+      <div class="hint">MacBook Air без вентилятора — краще лишити ввімкненим. Mac із вентилятором можна вимкнути.</div>
+
       <div class="grp">Чати</div>
       <div class="card">
         <div class="row">
@@ -390,7 +397,9 @@
 
   if(S.theme) setSel('theme',S.theme);
   setSw('autoLogin',S.autoLogin); setSw('autoOllama',S.autoOllama); setSw('autoTts',S.autoTts);
-  setSw('optFlash',S.optFlash); setSw('optKv',S.optKv);
+  setSw('optFlash',S.optFlash); setSw('optKv',S.optKv); setSw('thermalOn',S.thermalOn);
+  if(S.thermalCool!=null) setRange('thermalCool','thermalCool-val',S.thermalCool,function(v){return v+'°C';});
+  if(S.thermalNow){ var tn=document.getElementById('thermalNow'); if(tn)tn.textContent=S.thermalNow; }
   if(S.transp!=null) setRange('transp','transp-val',S.transp,function(v){return v+'%';});
   if(S.chatsDir){ var cd=document.getElementById('chatsDir'); if(cd)cd.textContent=S.chatsDir; }
   if(S.hotkeys){ for(var k in S.hotkeys){ var e=document.getElementById('hk-'+k); if(e)e.textContent=S.hotkeys[k]||'—'; } }
@@ -399,6 +408,10 @@
   var th=document.getElementById('theme'); if(th) th.addEventListener('change',function(){B({a:'theme',v:th.value});});
   var tr=document.getElementById('transp'); if(tr) tr.addEventListener('input',function(){
     var s=document.getElementById('transp-val'); if(s)s.textContent=tr.value+'%'; B({a:'transp',v:+tr.value}); });
+  // поріг термопаузи: цифра — наживо, у config — лише коли відпустив повзунок
+  var tc=document.getElementById('thermalCool'); if(tc){
+    tc.addEventListener('input',function(){ var s=document.getElementById('thermalCool-val'); if(s)s.textContent=tc.value+'°C'; });
+    tc.addEventListener('change',function(){ B({a:'thermalCool',v:+tc.value}); }); }
   // тумблери: мокапний слухач перемкнув .on ПЕРШИМ, читаємо новий стан
   document.querySelectorAll('.sw[data-act]').forEach(function(s){
     s.addEventListener('click',function(){ B({a:s.dataset.act,v:s.classList.contains('on')}); }); });

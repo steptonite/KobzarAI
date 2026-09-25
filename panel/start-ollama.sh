@@ -29,7 +29,7 @@ export OLLAMA_ORIGINS="*"
 # --- оптимізація під 8ГБ RAM (керується тоглами в Налаштування → Загальні) ---
 [ "$FLASH" = "1" ] && export OLLAMA_FLASH_ATTENTION=1            # менше RAM на KV-кеш, швидше
 [ "$FLASH" = "1" ] && [ "$KV" = "1" ] && export OLLAMA_KV_CACHE_TYPE=q8_0  # KV у 8-біт (потребує flash)
-export OLLAMA_MAX_LOADED_MODELS=1    # одна модель у RAM — без свопу
+export OLLAMA_MAX_LOADED_MODELS=2    # 2 маленькі моделі разом (bge-m3 пошук + gemma3:1b відповідь) — RAG без свопу щоходу
 export OLLAMA_NUM_PARALLEL=1         # один слот, не множимо контекст у RAM
 export OLLAMA_KEEP_ALIVE=5m          # вивантажувати модель через 5хв простою
 # Бінарник шукаємо, а не припускаємо: на Intel це /usr/local/bin,
