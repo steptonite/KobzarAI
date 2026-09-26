@@ -67,28 +67,44 @@ def _build_reader():
         v = ctypes.c_int32(n)
         return cf.CFNumberCreate(None, 3, ctypes.byref(v))
 
+    cf.CFRelease.argtypes = [ctypes.c_void_p]
+
+    # ОДИН клієнт на процес. Раніше read() щоразу створював новий
+    # IOHIDEventSystemClient і не відпускав його: кожен = зʼєднання у WindowServer
+    # (він хостить HID-систему). За годину ~3400 штук, і на виході з Кобзаря WS
+    # 41 с їх розбирав → watchdog убив WindowServer, Мак завис (26.09.2026).
+    m = cf.CFDictionaryCreateMutable(
+        None, 0,
+        ctypes.byref(ctypes.c_void_p.in_dll(cf, "kCFTypeDictionaryKeyCallBacks")),
+        ctypes.byref(ctypes.c_void_p.in_dll(cf, "kCFTypeDictionaryValueCallBacks")))
+    cf.CFDictionarySetValue(m, _cfstr("PrimaryUsagePage"), _cfnum(kHIDPage_AppleVendor))
+    cf.CFDictionarySetValue(m, _cfstr("PrimaryUsage"),
+                            _cfnum(kHIDUsage_AppleVendor_TemperatureSensor))
+    client = iokit.IOHIDEventSystemClientCreate(None)
+    if not client:
+        raise RuntimeError("IOHIDEventSystemClientCreate failed")
+    iokit.IOHIDEventSystemClientSetMatching(client, m)
+    k_product = _cfstr("Product")
+
     def read():
-        m = cf.CFDictionaryCreateMutable(
-            None, 0,
-            ctypes.byref(ctypes.c_void_p.in_dll(cf, "kCFTypeDictionaryKeyCallBacks")),
-            ctypes.byref(ctypes.c_void_p.in_dll(cf, "kCFTypeDictionaryValueCallBacks")))
-        cf.CFDictionarySetValue(m, _cfstr("PrimaryUsagePage"), _cfnum(kHIDPage_AppleVendor))
-        cf.CFDictionarySetValue(m, _cfstr("PrimaryUsage"),
-                                _cfnum(kHIDUsage_AppleVendor_TemperatureSensor))
-        client = iokit.IOHIDEventSystemClientCreate(None)
-        iokit.IOHIDEventSystemClientSetMatching(client, m)
         services = iokit.IOHIDEventSystemClientCopyServices(client)
         if not services:
             return {}
         out = {}
-        for i in range(cf.CFArrayGetCount(services)):
-            sc = cf.CFArrayGetValueAtIndex(services, i)
-            name_ref = iokit.IOHIDServiceClientCopyProperty(sc, _cfstr("Product"))
-            name = objc.objc_object(c_void_p=ctypes.c_void_p(name_ref)) if name_ref else None
-            ev = iokit.IOHIDServiceClientCopyEvent(sc, kIOHIDEventTypeTemperature, 0, 0)
-            if ev:
-                val = iokit.IOHIDEventGetFloatValue(ev, kIOHIDEventTypeTemperature << 16)
-                out[str(name) if name else "sensor%d" % i] = round(val, 1)
+        try:
+            for i in range(cf.CFArrayGetCount(services)):
+                sc = cf.CFArrayGetValueAtIndex(services, i)
+                name_ref = iokit.IOHIDServiceClientCopyProperty(sc, k_product)
+                name = objc.objc_object(c_void_p=ctypes.c_void_p(name_ref)) if name_ref else None
+                ev = iokit.IOHIDServiceClientCopyEvent(sc, kIOHIDEventTypeTemperature, 0, 0)
+                if ev:
+                    val = iokit.IOHIDEventGetFloatValue(ev, kIOHIDEventTypeTemperature << 16)
+                    cf.CFRelease(ev)
+                    out[str(name) if name else "sensor%d" % i] = round(val, 1)
+                if name_ref:
+                    cf.CFRelease(name_ref)
+        finally:
+            cf.CFRelease(services)
         return out
 
     return read
