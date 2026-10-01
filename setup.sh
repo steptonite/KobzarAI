@@ -78,7 +78,7 @@ fi
 # 3. Панель
 echo "→ Панель → $PANEL_DIR"
 mkdir -p "$PANEL_DIR"
-cp "$REPO/panel/panel.py" "$REPO/panel/chatui.py" "$REPO/panel/make_icon.py" "$REPO/panel/kb.py" "$REPO/panel/thermal.py" "$PANEL_DIR/"
+cp "$REPO/panel/panel.py" "$REPO/panel/chatui.py" "$REPO/panel/chatfiles.py" "$REPO/panel/make_icon.py" "$REPO/panel/kb.py" "$REPO/panel/thermal.py" "$PANEL_DIR/"
 rm -rf "$PANEL_DIR/ui"; cp -R "$REPO/panel/ui" "$PANEL_DIR/ui"
 "$PY" -m venv "$PANEL_DIR/.venv"
 "$PANEL_DIR/.venv/bin/pip" install -q --upgrade pip
