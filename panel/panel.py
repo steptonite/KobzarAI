@@ -31,17 +31,17 @@ from Foundation import NSNotificationCenter, NSIndexSet
 from Quartz import CAGradientLayer, CATransaction
 from WebKit import WKWebView, WKWebViewConfiguration
 from PyObjCTools import AppHelper
+import chatfiles as _cf       # 30.09: картки файлів, перегляд тексту, що бачить модель, drop, відео/звук
 
-# 26.09.2026: міст до браузерних чатів (chatdrv) — лише якщо він є на цій машині.
-# Кобзар НЕ тягне Playwright у свій процес: chatbridge кличе CLI і читає теку черги.
+# Необов'язкове доповнення: якщо поруч із цим файлом є тека addons/ з модулем kobzar_addon,
+# Кобзар питає в нього про додаткові вкладки налаштувань і команди чату. Без модуля нічого не змінюється.
 try:
-    import sys as _sys
-    _sys.path.insert(0, os.path.expanduser("~/.claude/tools"))
-    import chatbridge as _cb
-    if not _cb.available():
-        _cb = None
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "addons"))
+    import kobzar_addon as _addon
+    if not _addon.available():
+        _addon = None
 except Exception:
-    _cb = None
+    _addon = None
 
 # 26.09: автодоповнення команд @/… у чаті — borderless non-activating панель.
 try:
@@ -627,27 +627,6 @@ def ps_loaded(max_age=0):
     return rows
 
 
-_CDRV_QDIR = os.path.expanduser("~/.claude/tools/.chatdrv_queue")
-_CDRV_NAMES = {"gpt": "ChatGPT", "deepseek": "DeepSeek", "qwen": "Qwen"}
-
-
-def cdrv_active():
-    """{site: {status: n}} для задач браузерних чатів, що ще не закінчились.
-    Читає файли черги chatdrv напряму — шапка оновлюється часто, процес не спавнимо."""
-    out = {}
-    try: names = [n for n in os.listdir(_CDRV_QDIR) if n.startswith("j") and n.endswith(".json")]
-    except Exception: return out
-    for n in names:
-        try:
-            with open(os.path.join(_CDRV_QDIR, n)) as fh: j = json.load(fh)
-        except Exception: continue
-        st = j.get("status")
-        if st in ("pending", "running", "blocked"):
-            d = out.setdefault(j.get("site") or "?", {})
-            d[st] = d.get(st, 0) + 1
-    return out
-
-
 def ram_size(line):
     """Розмір моделі в RAM з рядка `ollama ps` (напр. '3.3 GB')."""
     m = re.search(r"(\d+(?:[.,]\d+)?\s?[GM]B)", line or "")
@@ -727,35 +706,73 @@ def human_model_label(name):
     return ""
 
 
-# Автодоповнення команд у чаті (26.09): токен + людський опис. needs_cb=True —
-# рядок ховається, коли chatbridge (_cb) недоступний на цій машині.
-_AC_CMDS = [
-    ("@gpt", "ChatGPT у браузері", True),
-    ("@deepseek", "DeepSeek у браузері", True),
-    ("@qwen", "Qwen у браузері", True),
-    ("@чат", "сам вибере, куди краще", True),
-    ("@усі", "спитати всі три одразу", True),
-    ("/черга", "що зараз у роботі", True),
-    ("/скасувати", "зупинити задачу", True),
-    ("/результат", "забрати готову відповідь", True),
-    ("/повторити", "запустити ще раз", True),
-    ("/help", "довідка", False),
-]
+# Системний промт бази знань (30.09): фрагменти — особисті нотатки; брати лише дотичне.
+KB_PREAMBLE = ("Нижче — фрагменти з особистих нотаток користувача (його база знань). "
+               "Використовуй їх лише тоді, коли вони справді стосуються запитання. "
+               "Коли спираєшся на фрагмент, назви джерело в квадратних дужках, наприклад [назва_файлу.md]. "
+               "Якщо фрагменти не по темі — не згадуй їх, відповідай звичайно зі своїх загальних знань "
+               "і не вдавай, що знайшов щось у нотатках. Відповідай тією мовою, якою написав користувач.\n\n"
+               "=== НОТАТКИ ===\n")
+KB_CHARS_PER_TOKEN = 2.5     # обережна оцінка для кирилиці: скільки символів у токені
+
+# Вкладення чату (30.09): копія в ~/Documents/KobzarAI/Вкладення/<дата>/, мініатюра для картинок.
+_ATT_IMG = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".heic", ".tif", ".tiff")
+_ATT_VID = (".mp4", ".mov", ".webm", ".m4v")
+_THUMBS = {}
 
 
-def _ac_matches(text, cb_available=True):
-    """Підказки автодоповнення для першого токена поля вводу чату.
-    `text` — вміст ВІД ПОЧАТКУ ПОЛЯ ДО КУРСОРА: якщо курсор вже вийшов за перший
-    токен (у head є пробіл/розрив рядка) або перший символ не @/— підказок нема
-    (пуста команда доскладена, автодоповнення не потрібне). cb_available=False
-    (chatbridge недоступний) лишає лише команди, що працюють і без нього."""
-    head = text or ""
-    if not head or head[0] not in "@/":
-        return []
-    if re.search(r"\s", head):
-        return []
-    return [(tok, desc) for tok, desc, needs_cb in _AC_CMDS
-            if (cb_available or not needs_cb) and tok.startswith(head)]
+def att_root():
+    return os.path.join(os.path.expanduser("~/Documents/KobzarAI/Вкладення"), time.strftime("%Y-%m-%d"))
+
+
+def att_kind(path):
+    return _cf.kind_of(path)          # img/vid/aud/md/txt/csv/json/code/pdf/doc/sheet/slides/zip/file
+
+
+def att_store(src, name=None):
+    """Копіює файл у теку вкладень (APFS-клон, без місця й часу), імʼя не перезаписує чуже."""
+    root = att_root(); os.makedirs(root, exist_ok=True)
+    name = re.sub(r"[/\\:\x00-\x1f]", "_", name or os.path.basename(src)).strip(". ") or "файл"
+    base, ext = os.path.splitext(name); dst = os.path.join(root, name); n = 1
+    while os.path.exists(dst):
+        n += 1; dst = os.path.join(root, "%s %d%s" % (base, n, ext))
+    if subprocess.run(["cp", "-c", src, dst], capture_output=True).returncode != 0:
+        shutil.copy2(src, dst)
+    return dst
+
+
+def att_thumb(path, px=200):
+    """Мініатюра-JPEG у data-URL (ImageIO, без читання всієї картинки в памʼять). "" якщо не вийшло."""
+    try:
+        key = (path, os.path.getmtime(path))
+        if key in _THUMBS: return _THUMBS[key]
+        import Quartz as Q
+        src = Q.CGImageSourceCreateWithURL(NSURL.fileURLWithPath_(path), None)
+        img = Q.CGImageSourceCreateThumbnailAtIndex(src, 0, {
+            Q.kCGImageSourceCreateThumbnailFromImageAlways: True,
+            Q.kCGImageSourceCreateThumbnailWithTransform: True,
+            Q.kCGImageSourceThumbnailMaxPixelSize: px}) if src else None
+        if img is None: return ""
+        from Foundation import NSMutableData
+        buf = NSMutableData.data()
+        dst = Q.CGImageDestinationCreateWithData(buf, "public.jpeg", 1, None)
+        Q.CGImageDestinationAddImage(dst, img, {Q.kCGImageDestinationLossyCompressionQuality: 0.8})
+        Q.CGImageDestinationFinalize(dst)
+        out = "data:image/jpeg;base64," + base64.b64encode(bytes(buf)).decode()
+        if len(_THUMBS) > 200: _THUMBS.clear()
+        _THUMBS[key] = out
+        return out
+    except Exception:
+        return ""
+
+
+def att_view(a):
+    """Запис історії {name,path,kind} → те, що малює сторінка (мініатюра щоразу з файлу; gone, якщо файл зник)."""
+    p = a.get("path", "")
+    v = _cf.card_info(p, a.get("name"))     # імʼя, тип, розмір, «можна переглянути», адреса програвача
+    if v["kind"] == "img" and not v["gone"]:
+        v["thumb"] = att_thumb(p)
+    return v
 
 
 # Куратований fallback під 8ГБ RAM — коли офіційний ендпоінт недоступний.
@@ -884,6 +901,49 @@ def is_embed_model(name):
     return any(m in low for m in _EMBED_MARKERS)
 
 
+def ram_menu_lines(loaded, limit=3):
+    """Рядки для меню трея: (заголовок, [до `limit` рядків]) з виводу `ollama ps`.
+    Кожна модель окремо «назва · розмір»; ембед-модель (для пошуку) — з приміткою."""
+    rows = []
+    for l in loaded or []:
+        nm = l.split("  ")[0].strip()
+        if not nm:
+            continue
+        sz = ram_size(l)
+        txt = "   " + nm + (f"  ·  {sz}" if sz else "")
+        if is_embed_model(nm):
+            txt += "  ·  для пошуку"
+        rows.append(txt)
+    if not rows:
+        return "Модель у RAM:", ["   (нічого — RAM вільна)"]
+    return ("Моделі в RAM:" if len(rows) > 1 else "Модель у RAM:"), rows[:limit]
+
+
+def ram_chips(loaded, limit=2):
+    """Плашки шапки чату з виводу `ollama ps`: [(колір, текст, підказка)].
+    Чат-модель першою, пошукова — з приміткою «для пошуку»; понад `limit` — плашка «+N».
+    Підказка в кожної плашки — повний список зі розмірами."""
+    rows = []
+    for l in loaded or []:
+        parts = (l or "").split()
+        if not parts:
+            continue
+        nm = parts[0]
+        size = ram_size(l).replace("GB", "ГБ").replace("MB", "МБ").replace(".", ",")
+        rows.append((is_embed_model(nm), nm.replace(":latest", ""), size))
+    if not rows:
+        return []
+    rows.sort(key=lambda r: r[0])                       # стабільно: чат-моделі перед пошуковими
+    tip = "У памʼяті зараз:\n" + "\n".join(
+        "%s%s — %s" % (n, " (для пошуку)" if e else "", sz or "розмір невідомий") for e, n, sz in rows)
+    out = []
+    for emb, nm, sz in rows[:limit]:
+        out.append(("green", nm + (" · для пошуку" if emb else (" · " + sz if sz else "")), tip))
+    if len(rows) > limit:
+        out.append(("more", "+%d" % (len(rows) - limit), tip))
+    return out
+
+
 def pick_chat_model(models):
     for p in CHAT_PREF:
         if p in models:
@@ -895,17 +955,24 @@ def pick_chat_model(models):
     return None                        # лише ембед/vl-моделі → чат-моделі НЕМА (не брешемо)
 
 
-# 26.09.2026: медіа у відповідях браузерних чатів. chatdrv.ask() сьогодні НЕ повертає
-# жодного поля картинки/файлу (лише site/answer/error/... — перевірено в самому
-# chatdrv.py), тож це захисний рендер НАПЕРЕД: якщо колись у тексті відповіді з'явиться
-# локальний шлях до файлу — покажемо інлайн, а не голим текстом/лінком, що не працює.
+# 26.09.2026: медіа у відповідях. Якщо в тексті відповіді є локальний шлях до файлу —
+# показуємо картку/мініатюру інлайн, а не голим текстом чи лінком, що не працює.
 _MEDIA_IMG_EXT = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp")
 _MEDIA_VID_EXT = (".mp4", ".mov", ".webm", ".m4v")
-_MEDIA_FILE_EXT = _MEDIA_IMG_EXT + _MEDIA_VID_EXT + (
-    ".pdf", ".txt", ".md", ".csv", ".json", ".zip", ".docx", ".xlsx", ".pptx", ".log")
+_MEDIA_AUD_EXT = tuple(sorted(_cf.AUD_EXT))
+_MEDIA_FILE_EXT = _MEDIA_IMG_EXT + _MEDIA_VID_EXT + _MEDIA_AUD_EXT + (
+    ".pdf", ".txt", ".md", ".markdown", ".csv", ".tsv", ".json", ".zip", ".docx", ".doc", ".xlsx", ".xls",
+    ".pptx", ".ppt", ".key", ".rtf", ".odt", ".numbers", ".pages", ".yaml", ".yml", ".log")
 _MEDIA_MAX_BYTES = 8 * 1024 * 1024                    # ~8 МБ — стеля на base64-інлайн
+# 30.09.2026: картинка 1,6 МБ → base64 2,2 МБ → ще копії в JS-рядку, атрибуті src і замиканні
+# кнопок = ~10 МБ на ОДНУ картинку. На 8 ГБ Маці під свопом це роняло/глушило веб-вʼю.
+# Тепер велике йде МІНІАТЮРОЮ (sips, ≤1280 px, JPEG): клік по ній відкриває оригінал.
+_MEDIA_INLINE_MAX = 400 * 1024                        # дрібніше — інлайнимо як є
+_MEDIA_THUMB_SRC_MAX = 64 * 1024 * 1024               # оригінал більший — навіть на мініатюру не беремось (чіп)
+_MEDIA_THUMB_PX = 1280
+_MEDIA_THUMB_DIR = os.path.expanduser("~/Library/Caches/KobzarAI/thumbs")
 _MEDIA_PATH_RE = re.compile(
-    r"(/[^\s`'\"]+?(?:" + "|".join(re.escape(e) for e in _MEDIA_FILE_EXT) + r"))", re.I)
+    r"(/[^\s`'\"]+?(?:" + "|".join(re.escape(e) for e in _MEDIA_FILE_EXT) + r")(?![A-Za-z0-9]))", re.I)
 
 
 def _media_data_url(path, ext):
@@ -919,24 +986,34 @@ def _media_data_url(path, ext):
         return None
 
 
-_CDRV_HEAD = re.compile(r"^\*\*([^*\n]+)\*\*([^\n]*)\n\n")
-
-
-def _cdrv_split(text):
-    """26.09: «**DeepSeek** · 5 с\n\nвідповідь» → ("DeepSeek · 5 с", "відповідь").
-    Старі записи ще несуть номер задачі й «(капча на…)» — вирізаємо й там."""
-    m = _CDRV_HEAD.match(text or "")
-    if not m:
-        return "браузерний чат", text
-    rest = re.sub(r"\s*·\s*`[^`]*`", "", m.group(2))
-    rest = re.sub(r"\s*\(капча[^)]*\)", "", rest).strip()
-    return (m.group(1) + (" " + rest if rest else "")).strip(), text[m.end():]
+def _media_thumb_url(path, size, mtime):
+    """Мініатюра картинки як data-URL (кеш на диску) або None. Без сторонніх залежностей: sips."""
+    try:
+        import hashlib
+        key = hashlib.sha1(("%s|%d|%d|%d" % (path, size, int(mtime), _MEDIA_THUMB_PX)).encode()).hexdigest()[:24]
+        os.makedirs(_MEDIA_THUMB_DIR, exist_ok=True)
+        out = os.path.join(_MEDIA_THUMB_DIR, key + ".jpg")
+        if not (os.path.isfile(out) and os.path.getsize(out) > 0):
+            tmp = out + ".part"
+            r = subprocess.run(["/usr/bin/sips", "-Z", str(_MEDIA_THUMB_PX), "-s", "format", "jpeg",
+                                "-s", "formatOptions", "82", path, "--out", tmp],
+                               capture_output=True, timeout=20)
+            if r.returncode != 0 or not os.path.isfile(tmp) or os.path.getsize(tmp) == 0:
+                try: os.remove(tmp)
+                except OSError: pass
+                return None
+            os.replace(tmp, out)
+        with open(out, "rb") as fh:
+            return "data:image/jpeg;base64,%s" % base64.b64encode(fh.read()).decode("ascii")
+    except Exception:
+        return None
 
 
 def _embed_local_media(text):
-    """Локальний шлях до картинки/відео (існуючий файл, ≤8 МБ) → інлайн-токен для
-    md() у chatui.py: ![[img:NAME|PATH]](data:...) / ![[vid:...]]. Інший наявний
-    файл → ![[file:NAME|PATH]](file) — файл-чіп, відкривається кліком через bridge('open').
+    """Локальний шлях до картинки/відео (існуючий файл) → інлайн-токен для md() у chatui.py:
+    ![[img:NAME|PATH]](data:...) / ![[vid:...]]. Картинка >400 КБ йде мініатюрою (≤1280 px), а
+    оригінал відкривається кліком; >8 МБ теж мініатюрою (якщо вдалось), інакше файл-чіп
+    ![[file:NAME|PATH]](file). Відео ≤8 МБ інлайн, більше — чіп.
     Шлях, якого нема на диску, або що не читається — лишаємо як звичайний текст."""
     def sub(m):
         p = m.group(1)
@@ -944,19 +1021,27 @@ def _embed_local_media(text):
             if not os.path.isfile(p):
                 return p
             size = os.path.getsize(p)
+            mtime = os.path.getmtime(p)
         except Exception:
             return p
         ext = os.path.splitext(p)[1].lower()
         base = os.path.basename(p)
-        if ext in _MEDIA_IMG_EXT and 0 < size <= _MEDIA_MAX_BYTES:
-            data = _media_data_url(p, ext)
+        if ext in _MEDIA_IMG_EXT and size > 0:
+            data = None
+            if size <= _MEDIA_INLINE_MAX or (ext == ".gif" and size <= _MEDIA_MAX_BYTES):
+                data = _media_data_url(p, ext)              # дрібне / анімований gif — як є
+            elif size <= _MEDIA_THUMB_SRC_MAX:
+                data = _media_thumb_url(p, size, mtime)
+                if data is None and size <= _MEDIA_MAX_BYTES:
+                    data = _media_data_url(p, ext)          # sips не зміг — оригінал, якщо ≤8 МБ
             if data:
                 return "![[img:%s|%s]](%s)" % (base, p, data)
-        elif ext in _MEDIA_VID_EXT and 0 < size <= _MEDIA_MAX_BYTES:
-            data = _media_data_url(p, ext)
-            if data:
-                return "![[vid:%s|%s]](%s)" % (base, p, data)
-        return "![[file:%s|%s]](file)" % (base, p)
+        elif ext in _MEDIA_VID_EXT and size > 0:
+            # 30.09: відео й звук — не base64, а локальна адреса kobzar-file:// (будь-який розмір, з перемоткою)
+            return "![[vid:%s|%s]](%s)" % (base, p, _cf.serve_url(p))
+        elif ext in _MEDIA_AUD_EXT and size > 0:
+            return "![[aud:%s|%s]](%s)" % (base, p, _cf.serve_url(p))
+        return "![[file:%s|%s]](%s)" % (base, p, _cf.token_tail(p))
     try:
         return _MEDIA_PATH_RE.sub(sub, text or "")
     except Exception:
@@ -1183,119 +1268,6 @@ def is_dark():
         return False
 
 
-# Готовий веб-патерн чату (як ChatGPT/Claude): справжні CSS-бульбашки + markdown.
-# Стрім токенів і керування — через JS (web/_js), не нативним малюванням.
-_CHAT_HTML = r"""<!doctype html><html><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<style>
-:root{ --accent: __ACCENT__; }
-*{box-sizing:border-box;-webkit-user-select:text;}
-html,body{margin:0;padding:0;min-height:100%;}
-body{font:14px/1.55 -apple-system,"SF Pro Text",system-ui,sans-serif;
-  background:__BG__;color:__FG__;-webkit-font-smoothing:antialiased;}
-#log{padding:18px 16px 24px;display:flex;flex-direction:column;gap:14px;}
-.row{display:flex;}
-.row.user{justify-content:flex-end;}
-.row.ai{flex-direction:column;align-items:flex-start;}
-.bubble{max-width:80%;padding:11px 15px;border-radius:18px;overflow-wrap:anywhere;}
-.user .bubble{background:var(--accent);color:#fff;border-bottom-right-radius:6px;}
-.ai .bubble{background:__AIBG__;color:__FG__;border-bottom-left-radius:6px;}
-.bubble p{margin:0 0 9px;} .bubble p:last-child{margin:0;}
-.bubble pre{background:__PREBG__;padding:11px 13px;border-radius:11px;
-  overflow-x:auto;margin:9px 0;}
-.bubble code{font:12.5px/1.45 "SF Mono",ui-monospace,monospace;}
-.bubble pre code{display:block;white-space:pre;}
-.bubble :not(pre)>code{background:__CODEBG__;padding:1px 5px;border-radius:5px;}
-.bubble h2,.bubble h3{margin:8px 0 4px;font-size:1.05em;font-weight:600;}
-.bubble ul,.bubble ol{margin:7px 0;padding-left:20px;} .bubble li{margin:3px 0;}
-.bubble a{color:var(--accent);}
-.hit{margin:0 0 12px;padding-bottom:11px;border-bottom:1px solid __CODEBG__;}
-.hit:last-child{border-bottom:none;padding-bottom:0;}
-.hitttl{display:inline-block;margin-bottom:4px;color:var(--accent);font-weight:600;
-  text-decoration:none;cursor:pointer;}
-.hitttl:hover{text-decoration:underline;}
-.hitxt{opacity:.82;white-space:pre-wrap;overflow-wrap:anywhere;}
-.acts{display:flex;gap:6px;margin:5px 0 0 4px;}
-.act{cursor:pointer;color:__MUTED__;display:inline-flex;align-items:center;gap:4px;
-  font:11.5px/1 -apple-system,system-ui,sans-serif;background:none;border:0;
-  padding:3px 6px;border-radius:7px;-webkit-user-select:none;transition:color .12s,background .12s;}
-.act:hover{background:__CODEBG__;color:__FG__;}
-.act svg{width:13px;height:13px;}
-.empty{color:__MUTED__;text-align:center;margin-top:48px;font-size:13px;}
-.typing{display:inline-block;width:7px;height:15px;background:__MUTED__;
-  border-radius:2px;vertical-align:-2px;animation:bl 1s steps(2,end) infinite;}
-@keyframes bl{50%{opacity:0;}}
-</style></head><body><div id="log"></div><script>
-var log=document.getElementById('log'),aiB=null,aiRaw='';
-function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
-function md(t){var bl=[];
- t=t.replace(/```(\w*)\n?([\s\S]*?)```/g,function(m,l,c){
-   bl.push('<pre><code>'+esc(c.replace(/\n$/,''))+'</code></pre>');return '¦'+(bl.length-1)+'¦';});
- t=esc(t);
- t=t.replace(/`([^`\n]+)`/g,'<code>$1</code>');
- t=t.replace(/\*\*([^*]+)\*\*/g,'<strong>$1</strong>');
- t=t.replace(/(^|[^*])\*([^*\n]+)\*/g,'$1<em>$2</em>');
- t=t.replace(/^### (.+)$/gm,'<h3>$1</h3>').replace(/^##? (.+)$/gm,'<h2>$1</h2>');
- t=t.replace(/(?:^|\n)((?:[-*] .+(?:\n|$))+)/g,function(m,b){
-   return '\n<ul>'+b.trim().split('\n').map(function(l){return '<li>'+l.replace(/^[-*] /,'')+'</li>';}).join('')+'</ul>';});
- t=t.replace(/(?:^|\n)((?:\d+\. .+(?:\n|$))+)/g,function(m,b){
-   return '\n<ol>'+b.trim().split('\n').map(function(l){return '<li>'+l.replace(/^\d+\. /,'')+'</li>';}).join('')+'</ol>';});
- t=t.split(/\n{2,}/).map(function(p){p=p.trim();if(!p)return '';
-   if(/^<(ul|ol|pre|h[23])/.test(p))return p;return '<p>'+p.replace(/\n/g,'<br>')+'</p>';}).join('');
- t=t.replace(/¦(\d+)¦/g,function(m,i){return bl[i];});
- return t;}
-function scr(){window.scrollTo(0,document.body.scrollHeight);}
-function clearAll(){log.innerHTML='';aiB=null;aiRaw='';}
-function rmE(){var e=log.querySelector('.empty');if(e)e.remove();}
-function empty(){clearAll();var d=document.createElement('div');d.className='empty';
-  d.textContent='Порожній чат. Напиши запит нижче.';log.appendChild(d);}
-function row(cls){rmE();var r=document.createElement('div');r.className='row '+cls;
-  r.innerHTML='<div class="bubble"></div>';log.appendChild(r);return r.firstChild;}
-var CP='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';
-var SPK='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5 6 9H2v6h4l5 4z"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/><path d="M19 5a9 9 0 0 1 0 14"/></svg>';
-var RG='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/></svg>';
-function bridge(name,txt){try{if(window.webkit&&webkit.messageHandlers&&webkit.messageHandlers[name]){webkit.messageHandlers[name].postMessage(txt);}}catch(e){}}
-function copyText(txt,btn){var done=false;
-  try{if(window.webkit&&webkit.messageHandlers&&webkit.messageHandlers.copy){
-    webkit.messageHandlers.copy.postMessage(txt);done=true;}}catch(e){}
-  if(!done){var ta=document.createElement('textarea');ta.value=txt;
-    ta.style.position='fixed';ta.style.opacity='0';document.body.appendChild(ta);ta.focus();ta.select();
-    try{document.execCommand('copy');}catch(e){}document.body.removeChild(ta);}
-  var l=btn.querySelector('.lbl');if(l){var o=l.textContent;l.textContent='Скопійовано';
-    setTimeout(function(){l.textContent=o;},1200);}}
-function mkAct(icon,label,title,fn){var b=document.createElement('button');
-  b.className='act';b.title=title;b.innerHTML=icon+'<span class="lbl">'+label+'</span>';
-  b.onclick=fn;return b;}
-function addActs(rowEl,raw){
-  var old=rowEl.querySelector('.acts');if(old)old.remove();   // не дублювати при regen
-  var a=document.createElement('div');a.className='acts';
-  var c=mkAct(CP,'Копіювати','Копіювати',function(){copyText(raw,c);});
-  var s=mkAct(SPK,'Озвучити','Озвучити відповідь',function(){bridge('speak',raw);});
-  var r=mkAct(RG,'Ще раз','Перегенерувати відповідь',function(){bridge('regen',raw);});
-  a.appendChild(c);a.appendChild(s);a.appendChild(r);rowEl.appendChild(a);}
-function addUser(t){row('user').textContent=t;scr();}
-function addAI(t){var b=row('ai');b.innerHTML=md(t);if(t)addActs(b.parentNode,t);scr();}
-function aiStart(){var b=row('ai');b.innerHTML='<span class="typing"></span>';aiB=b;aiRaw='';scr();}
-function aiAppend(c){if(!aiB)aiStart();aiRaw+=c;aiB.innerHTML=md(aiRaw);scr();}
-function aiEnd(){if(aiB){if(!aiRaw)aiB.innerHTML='<em style="opacity:.55">порожньо</em>';
-  else addActs(aiB.parentNode,aiRaw);}aiB=null;aiRaw='';}
-var hitPaths=[];
-function openHit(el){var p=hitPaths[+el.getAttribute('data-i')];if(p)bridge('open',p);}
-function aiHits(arr){if(!aiB)aiStart();aiRaw='';hitPaths=[];var h='';
-  for(var i=0;i<arr.length;i++){var it=arr[i];hitPaths.push(it.path||'');
-    var ttl=it.path?('<a class="hitttl" href="#" data-i="'+i+'" title="'+esc(it.path)+
-      '" onclick="openHit(this);return false;">'+esc(it.tag)+'</a>'):
-      ('<div class="hitttl" style="cursor:default">'+esc(it.tag)+'</div>');
-    h+='<div class="hit">'+ttl+'<div class="hitxt">'+esc(it.text||'')+'</div></div>';
-    aiRaw+=it.tag+'\n'+(it.text||'')+'\n\n';}
-  aiB.innerHTML=h;if(arr.length)addActs(aiB.parentNode,aiRaw);scr();}
-function cdrvPlan(t){var b=row('ai');b.innerHTML=md(t);var a=document.createElement('div');a.className='acts';
-  var g=mkAct('▶','Пустити','Поставити в чергу браузерних чатів',function(){bridge('cdrv','go');a.remove();});
-  var x=mkAct('✕','Не треба','Не запускати цей план',function(){bridge('cdrv','drop');a.remove();});
-  a.appendChild(g);a.appendChild(x);b.parentNode.appendChild(a);scr();}
-function note(t){rmE();var d=document.createElement('div');d.className='empty';
-  d.textContent=t;log.appendChild(d);scr();}
-</script></body></html>"""
 
 
 _UKR_MON = ["січ", "лют", "бер", "кві", "тра", "чер",
@@ -1336,18 +1308,6 @@ class ChatRowView(NSTableRowView):
         path.fill()
 
 
-class _ChatTable(NSTableView):
-    """Таблиця списку чатів. Перевизначаємо menuForEvent_: повертаємо меню напряму,
-    БЕЗ super → AppKit не малює власне синє menu-target кільце на правий клік (двоїлося
-    з нашою округлою підсвіткою). Рядок-ціль запамʼятовуємо в делегата (_ctx_row),
-    щоб не змінювати активний чат самим лише правим кліком."""
-    def menuForEvent_(self, event):
-        p = self.convertPoint_fromView_(event.locationInWindow(), None)
-        r = self.rowAtPoint_(p)
-        d = self.delegate()
-        try: d._ctx_row = int(r)
-        except Exception: pass
-        return self.menu() if r >= 0 else None
 
 
 class _LibRowView(NSTableRowView):
@@ -1372,7 +1332,7 @@ class _LibRowView(NSTableRowView):
 
 
 def chat_html():
-    # 26.09.2026: чат = одна сторінка (chatui.py); старий _CHAT_HTML лишився як запасний
+    # 26.09.2026: чат = одна сторінка (chatui.py) (старий _CHAT_HTML прибрано 27.09.2026)
     try:
         import chatui
     except ImportError:
@@ -1480,13 +1440,40 @@ class SlidingSegment(NSView):
         self.setNeedsDisplay_(True)
 
     @objc.python_method
-    def _segw(self):
-        return self.bounds().size.width / max(1, len(self._labels))
+    def _widths(self):
+        """Ширини сегментів пропорційні підписам (довгий підпис не впирається в краї)."""
+        tot = self.bounds().size.width
+        nat = []
+        for lab in self._labels:
+            sz = NSAttributedString.alloc().initWithString_attributes_(
+                lab, {NSFontAttributeName: self._font}).size()
+            nat.append(sz.width + 28.0)
+        k = tot / max(1.0, sum(nat))
+        return [n * k for n in nat]
 
     @objc.python_method
     def _center(self, i):
-        w = self._segw()
-        return w * i + w / 2.0
+        ws = self._widths()
+        return sum(ws[:i]) + ws[i] / 2.0
+
+    @objc.python_method
+    def _pill_w(self, x):
+        """Ширина плашки в позиції x: між сусідніми сегментами плавно перетікає."""
+        ws = self._widths(); cs = [self._center(i) for i in range(len(ws))]
+        if x <= cs[0]: return ws[0]
+        for i in range(1, len(ws)):
+            if x <= cs[i]:
+                t = (x - cs[i - 1]) / max(1e-6, cs[i] - cs[i - 1])
+                return ws[i - 1] + (ws[i] - ws[i - 1]) * t
+        return ws[-1]
+
+    @objc.python_method
+    def _index_at(self, x):
+        acc = 0.0
+        for i, w in enumerate(self._widths()):
+            acc += w
+            if x < acc: return i
+        return len(self._labels) - 1
 
     def setTarget_action_(self, t, a):
         self._target = t; self._action = a
@@ -1507,8 +1494,8 @@ class SlidingSegment(NSView):
         if self._pill_x is None:
             self._pill_x = self._center(self._sel)
         h = self.bounds().size.height
-        w = self._segw()
-        pw = w - 6; ph = h - 6
+        ws = self._widths()
+        pw = self._pill_w(self._pill_x) - 6; ph = h - 6
         rad = ph / 2.0                       # повністю кругла пігулка (нести в круглій капсулі)
         pill = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
             NSMakeRect(self._pill_x - pw / 2.0, 3, pw, ph), rad, rad)
@@ -1521,16 +1508,18 @@ class SlidingSegment(NSView):
             NSColor.unemphasizedSelectedContentBackgroundColor().setFill()
             sel_col = NSColor.labelColor()
         pill.fill()
+        x0 = 0.0
         for i, lab in enumerate(self._labels):
             col = sel_col if i == self._sel else NSColor.secondaryLabelColor()
             s = NSAttributedString.alloc().initWithString_attributes_(
                 lab, {NSForegroundColorAttributeName: col, NSFontAttributeName: self._font})
             sz = s.size()
-            s.drawAtPoint_(NSMakePoint(w * i + (w - sz.width) / 2.0, (h - sz.height) / 2.0))
+            s.drawAtPoint_(NSMakePoint(x0 + (ws[i] - sz.width) / 2.0, (h - sz.height) / 2.0))
+            x0 += ws[i]
 
     def mouseDown_(self, e):
         p = self.convertPoint_fromView_(e.locationInWindow(), None)
-        i = max(0, min(len(self._labels) - 1, int(p.x / self._segw())))
+        i = max(0, min(len(self._labels) - 1, self._index_at(p.x)))
         if i == self._sel:
             return
         self._sel = i
@@ -1767,31 +1756,6 @@ class _HoverButton(NSButton):
         self.setAlphaValue_(1.0)
 
 
-class _ACRow(NSTextField):
-    """Рядок автодоповнення команд у чаті (26.09): токен жирним + опис сірим,
-    підсвічується вибраним (клавіші) або кліком (миша) — вставляє owner._ac_pick."""
-    def initWithFrame_(self, fr):
-        self = objc.super(_ACRow, self).initWithFrame_(fr)
-        if self is None: return None
-        self.setBezeled_(False); self.setEditable_(False); self.setSelectable_(False)
-        self.setDrawsBackground_(True); self.setBackgroundColor_(NSColor.clearColor())
-        self._owner = None; self._idx = 0
-        return self
-
-    def setOwnerIdx_(self, pair):
-        self._owner, self._idx = pair
-
-    def setPicked_(self, on):
-        try:
-            self.setBackgroundColor_(
-                accent_color().colorWithAlphaComponent_(0.16) if on else NSColor.clearColor())
-        except Exception: pass
-
-    def mouseDown_(self, e):
-        if self._owner is not None:
-            self._owner._ac_pick(self._idx)
-
-
 # --- вікно налаштувань: голос/хоткеї + моделі (скляне) ---
 class SettingsWindow(NSObject):
     def initWithPanel_(self, panel):
@@ -1861,15 +1825,8 @@ class SettingsWindow(NSObject):
         self.chat_model_lbl = None
         self.chat_size_lbl = None
         self.chat_dot = None
-        self.chat_chips = None
         self.chat_at = None
         # 26.09: автодоповнення команд @/… у чаті (бордерлес-панель над полем)
-        self._ac_panel = None
-        self._ac_content = None
-        self._ac_rows = []
-        self._ac_items = []
-        self._ac_idx = 0
-        self._ac_open = False
         self.hist_tbl = None
         self._chat_host = None      # повноекранний контейнер чату (поза скрол-сторінками)
         self._chat_built = False
@@ -1980,8 +1937,7 @@ class SettingsWindow(NSObject):
 
     @objc.python_method
     def select_tab(self, i):
-        self._ac_hide()             # 26.09: зміна вкладки — список автодоповнення не в місці
-        i = max(0, min(3, int(i)))
+        i = max(0, min(3 + len(self._ext_tabs()), int(i)))
         if self.seg is not None:
             try: self.seg.setSelectedSegment_(i)
             except Exception: pass
@@ -1993,14 +1949,24 @@ class SettingsWindow(NSObject):
             self._chat_host.setHidden_(True)
         if self._scroll is not None:
             self._scroll.setHidden_(False)
-        keys = ["general", "voice", "models"]
-        builders = [self._page_general, self._page_voice, self._page_models]
+        keys = {0: "general", 1: "voice", 2: "models"}
+        builders = {0: self._page_general, 1: self._page_voice, 2: self._page_models}
+        tab = None
+        if i >= 4:                                # вкладка, яку додало доповнення
+            tab = self._ext_tabs()[i - 4]
+            keys[i] = tab["key"]; builders[i] = lambda: tab["build"](self)
         key = keys[i]
         page = self._pages.get(key)
         if page is None:
-            page = builders[i](); self._pages[key] = page
-        elif key == "models":
-            self._cdrv_refresh()          # черга/браузер могли змінитись
+            if tab is None:
+                page = builders[i]()
+            else:
+                try: page = builders[i]()
+                except Exception: page = self._page([])
+            self._pages[key] = page
+        elif tab is not None and tab.get("show"):
+            try: tab["show"](self)                # що могло змінитись, поки вкладку не бачили
+            except Exception: pass
         self._set_page(page, key)
 
     @objc.python_method
@@ -2455,7 +2421,7 @@ class SettingsWindow(NSObject):
             NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable
             | NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskFullSizeContentView,
             NSBackingStoreBuffered, False)
-        self.win.setMinSize_((560, 460))
+        self.win.setMinSize_((600, 460))
         self.win.setMaxSize_((100000, 100000))     # без штучного обмеження ширини
         self.win.setCollectionBehavior_(1 << 9)    # FullScreenNone
         self.win.setTitle_("KobzarAI — Налаштування")
@@ -2496,15 +2462,16 @@ class SettingsWindow(NSObject):
         # світлофор і сегмент стають на одну лінію без ручного зсуву кнопок (той ламався:
         # кнопки живуть у 32px-тайтлбарі, нижче не влазять). Бонус: сегмент «плаває
         # скляний» над контентом, що скролиться під ним (узгоджено з fade зверху).
-        seg = SlidingSegment.alloc().initWithLabels_frame_(
-            ["Загальні", "Голос", "Моделі", "Чат"], NSMakeRect(0, 0, 380, 30))
+        _labels = ["Загальні", "Голос", "Моделі", "Чат"] + [t["title"] for t in self._ext_tabs()]
+        self._segw = 88 * len(_labels)                # 352 для чотирьох, 440 для п'яти
+        seg = SlidingSegment.alloc().initWithLabels_frame_(_labels, NSMakeRect(0, 0, self._segw, 30))
         self._al(seg)
         seg.setSelectedSegment_(0); seg.setTarget_action_(self, "tabChanged:")
         # trackless: власну track-плашку НЕ малюємо — її роль грає скляна капсула
         # unified-тулбара (macOS малює сам під центрованим item). Інакше дві плашки
         # накладались концентрично (track сегмента + капсула тулбара).
         seg.setTrackless_(True)
-        seg.widthAnchor().constraintEqualToConstant_(380).setActive_(True)
+        seg.widthAnchor().constraintEqualToConstant_(self._segw).setActive_(True)
         seg.heightAnchor().constraintEqualToConstant_(30).setActive_(True)
         self.seg = seg
         tb = NSToolbar.alloc().initWithIdentifier_("kobzar.settings.nav")
@@ -2549,7 +2516,8 @@ class SettingsWindow(NSObject):
             return None
         it = NSToolbarItem.alloc().initWithItemIdentifier_("nav")
         it.setView_(self.seg)
-        it.setMinSize_(NSMakeSize(380, 30)); it.setMaxSize_(NSMakeSize(380, 30))
+        _w = getattr(self, "_segw", 440)
+        it.setMinSize_(NSMakeSize(_w, 30)); it.setMaxSize_(NSMakeSize(_w, 30))
         return it
 
     @objc.python_method
@@ -2689,7 +2657,9 @@ class SettingsWindow(NSObject):
             self._group(auto, "Ollama та голос стартують самі при відкритті застосунку."),
             self._group(opt, "Діє при наступному старті Ollama (СТОП → Старт у меню)."),
             self._group(therm, "Вимкни на Mac з активним кулером (MacBook Pro), якщо не треба."),
-            self._group(chats, "Кожен чат — окремий .json. Зміна теки стосується подальших."),
+            self._group(chats, "Кожен чат — окремий .json. Зміна теки стосується подальших."
+                        + ("" if _addon is not None else
+                           " Є окрема приватна версія з чатами в браузері — напиши @steptonite.")),
             self._group(kb_sec, "Локальний семантичний пошук по обраній теці (Ollama bge-m3). "
                                 "Тумблер «книжки» у полі чату вмикає використання."),
             self._group(danger, "Моделі на зовнішньому диску НЕ чіпаються.")])
@@ -2884,157 +2854,63 @@ class SettingsWindow(NSObject):
         box.widthAnchor().constraintEqualToConstant_(124).setActive_(True)
         return box
 
-    # ═══ «Чати в браузері» — необов'язкове доповнення (26.09.2026) ═══════════
-    # Логіка й усе про браузер/профілі — у chatbridge (приватний); тут лише показ.
-    _CDRV_SITES = (("gpt", "ChatGPT"), ("deepseek", "DeepSeek"), ("qwen", "Qwen"))
-    _CDRV_BROWSERS = (("cft", "Chrome for Testing — окремий значок"), ("chrome", "Google Chrome"))
-    _CDRV_LOGIN = {"in": "увійдено", "out": "потрібен вхід", "closed": "вкладку не відкрито",
-                   "error": "не вдалося перевірити"}
+    # ═══ Місце для доповнень: додаткові вкладки налаштувань і обробник чату ═══
+    @objc.python_method
+    def _ext_tabs(self):
+        """[{key, title, build(вікно), show(вікно)}] від доповнення; порожньо, якщо його нема."""
+        tabs = getattr(self, "_ext_tabs_c", None)
+        if tabs is None:
+            try: tabs = list(_addon.tabs()) if _addon is not None else []
+            except Exception: tabs = []
+            self._ext_tabs_c = tabs
+        return tabs
 
     @objc.python_method
-    def _cdrv_section(self):
-        self._cdrv_ui = None
-        if _cb is None:
-            row = self._arow(self._albl("Не встановлено на цьому Mac", gray=True), self._albl(""))
-            return self._group(self._section("Чати в браузері", [row]),
-                "Необов'язкове доповнення: Кобзар пише у ваші ChatGPT, DeepSeek і Qwen через окремий "
-                "браузер — без платних API і ключів. Без нього все інше працює повністю локально.")
-        ui = {}
-        rows = []
-        if not any(_cb.browsers().values()):
-            sub = self._albl("Для чатів потрібен Google Chrome", gray=True, size=11.0)
-            v = self._vstack(1); v.addArrangedSubview_(self._albl("Браузер")); v.addArrangedSubview_(sub)
-            rows.append(self._arow(v, self._abtn("Завантажити Chrome", "cdrvGetChrome:",
-                                                 symbol="arrow.down.circle")))
-        else:
-            ui["br_sub"] = self._albl("перевіряю…", gray=True, size=11.0)
-            v = self._vstack(1); v.addArrangedSubview_(self._albl("Браузер"))
-            v.addArrangedSubview_(ui["br_sub"])
-            titles = [t for _, t in self._CDRV_BROWSERS]
-            cur = dict(self._CDRV_BROWSERS).get(_cb.browser(), titles[0])
-            ui["br_pop"] = self._apopup(titles, cur, "cdrvBrowser:")
-            ui["br_btn"] = self._abtn("Запустити", "cdrvStart:", symbol="play")
-            rows.append(self._arow(v, self._hstack_pair(ui["br_pop"], ui["br_btn"])))
-            ui["site_sub"] = {}
-            for i, (key, name) in enumerate(self._CDRV_SITES):
-                sub = self._albl("вхід не перевірено", gray=True, size=11.0)
-                v = self._vstack(1); v.addArrangedSubview_(self._albl(name)); v.addArrangedSubview_(sub)
-                b = self._abtn("Увійти", "cdrvLogin:", symbol="person.crop.circle")
-                b.setTag_(i)
-                ui["site_sub"][key] = sub
-                rows.append(self._arow(v, b))
-            ui["q_sub"] = self._albl("—", gray=True, size=11.0)
-            v = self._vstack(1); v.addArrangedSubview_(self._albl("Черга")); v.addArrangedSubview_(ui["q_sub"])
-            ui["chk"] = self._abtn("Перевірити вхід", "cdrvCheck:", symbol="arrow.clockwise")
-            ui["cancel"] = self._abtn("Скасувати все", "cdrvCancelAll:", danger=True)
-            rows.append(self._arow(v, self._hstack_pair(ui["cancel"], ui["chk"])))
-        self._cdrv_ui = ui
-        sec = self._group(self._section("Чати в браузері", rows),
-            "Необов'язково. Кобзар пише у ваші ChatGPT, DeepSeek і Qwen через окремий браузер — "
-            "без платних API і ключів. У чаті: @gpt, @чат (сам обере), @усі. Увійти треба один раз.")
-        if ui:
-            self._cdrv_refresh(login=True)
-        return sec
+    def _ext_tab_index(self, key):
+        for n, t in enumerate(self._ext_tabs()):
+            if t.get("key") == key:
+                return 4 + n
+        return None
 
     @objc.python_method
-    def _cdrv_refresh(self, login=False):
-        ui = getattr(self, "_cdrv_ui", None)
-        if not ui or _cb is None or getattr(self, "_cdrv_busy", False):
-            return
-        self._cdrv_busy = True
-        if login and "chk" in ui:
-            ui["chk"].setEnabled_(False)
-
-        def work():
-            st = {"up": False, "q": {}, "login": None}
-            try:
-                st["up"] = _cb.browser_up(); st["q"] = _cb.queue_counts()
-                if login and st["up"]:
-                    st["login"] = _cb.login_state()
-            except Exception as e:
-                st["err"] = str(e)[:120]
-            AppHelper.callAfter(self._cdrv_paint, st, login)
-        threading.Thread(target=work, daemon=True).start()
+    def _ext_page_extras(self, page):
+        """Додаткові секції доповнення на стандартній сторінці (напр. «models»)."""
+        if _addon is None:
+            return []
+        try: return list(_addon.page_sections(self, page))
+        except Exception: return []
 
     @objc.python_method
-    def _cdrv_paint(self, st, login):
-        self._cdrv_busy = False
-        ui = self._cdrv_ui or {}
-        if "br_sub" not in ui:
-            return
-        name = dict(self._CDRV_BROWSERS).get(_cb.browser(), "").split(" — ")[0]
-        ui["br_sub"].setStringValue_(("працює · " if st["up"] else "не запущено · ") + name)
-        ui["br_btn"].setHidden_(st["up"])
-        if login:
-            ui["chk"].setEnabled_(True)
-            got = st.get("login") or {}
-            for key, sub in ui["site_sub"].items():
-                if not st["up"]:
-                    sub.setStringValue_("браузер не запущено")
-                else:
-                    sub.setStringValue_(self._CDRV_LOGIN.get(got.get(key), "вхід не перевірено"))
-                sub.setTextColor_(NSColor.systemOrangeColor() if got.get(key) == "out"
-                                  else NSColor.secondaryLabelColor())
-        q = st.get("q") or {}
-        parts = [(q.get("running", 0), "в роботі"), (q.get("pending", 0), "чекає"),
-                 (q.get("blocked", 0), "на капчі")]
-        txt = " · ".join("%d %s" % (n, w) for n, w in parts if n)
-        ui["q_sub"].setStringValue_(txt or "порожня")
-        ui["cancel"].setEnabled_(bool(txt))
-        if st.get("err"):
-            ui["q_sub"].setStringValue_("збій: " + st["err"])
+    def _ext(self):
+        """Обробник чату від доповнення (або None). Створюється один раз на вікно."""
+        h = getattr(self, "_ext_h", False)
+        if h is False:
+            h = None
+            if _addon is not None:
+                try:
+                    h = _addon.chat_hook(self, {"save_chat": save_chat, "att_view": att_view,
+                                                "embed": _embed_local_media,
+                                                "call_after": AppHelper.callAfter})
+                except Exception:
+                    h = None
+            self._ext_h = h
+        return h
 
-    def cdrvCheck_(self, sender):
-        self._cdrv_refresh(login=True)
+    @objc.python_method
+    def _ext_owns(self, m):
+        """Повідомлення історії належить доповненню (у локальну модель не йде)."""
+        h = self._ext()
+        try: return bool(h is not None and h.owns(m))
+        except Exception: return False
 
-    def cdrvStart_(self, sender):
-        sender.setEnabled_(False)
-        self._cdrv_ui["br_sub"].setStringValue_("запускаю…")
-
-        def work():
-            try: _cb.start_browser()
-            except Exception: pass
-            AppHelper.callAfter(lambda: (sender.setEnabled_(True), self._cdrv_refresh(login=True)))
-        threading.Thread(target=work, daemon=True).start()
-
-    def cdrvLogin_(self, sender):
-        key = self._CDRV_SITES[int(sender.tag())][0]
-        sub = self._cdrv_ui["site_sub"][key]
-        sub.setStringValue_("відкриваю…")
-
-        def work():
-            try:
-                _cb.open_login(key); msg = "увійдіть у вікні браузера, тоді «Перевірити вхід»"
-            except Exception as e:
-                msg = "не вийшло: %s" % str(e)[:80]
-            AppHelper.callAfter(sub.setStringValue_, msg)
-            AppHelper.callAfter(self._cdrv_refresh)
-        threading.Thread(target=work, daemon=True).start()
-
-    def cdrvBrowser_(self, sender):
-        title = str(sender.titleOfSelectedItem())
-        key = next((k for k, t in self._CDRV_BROWSERS if t == title), None)
-        if not key or key == _cb.browser():
-            return
-        if not _cb.browsers().get(key):
-            sender.selectItemWithTitle_(dict(self._CDRV_BROWSERS)[_cb.browser()])
-            self._cdrv_ui["br_sub"].setStringValue_("%s на цьому Mac не знайдено" % title.split(" — ")[0])
-            return
-        _cb.set_browser(key)
-        self._cdrv_ui["br_sub"].setStringValue_(
-            "зміниться з наступного запуску браузера · вхід у чати доведеться повторити")
-
-    def cdrvCancelAll_(self, sender):
-        sender.setEnabled_(False)
-
-        def work():
-            try: _cb.cancel("all")
-            except Exception: pass
-            AppHelper.callAfter(self._cdrv_refresh)
-        threading.Thread(target=work, daemon=True).start()
-
-    def cdrvGetChrome_(self, sender):
-        NSWorkspace.sharedWorkspace().openURL_(NSURL.URLWithString_("https://www.google.com/chrome/"))
+    @objc.python_method
+    def _chat_cmds(self):
+        """[[токен, опис]] для меню чату (@ і /). Без доповнення меню порожнє."""
+        h = self._ext()
+        if h is None:
+            return []
+        try: return h.commands()
+        except Exception: return []
 
     @objc.python_method
     def _page_models(self, *_):
@@ -3192,7 +3068,7 @@ class SettingsWindow(NSObject):
         page = self._page([active, gen, pull,
             self._group(mdir, "Стандартний шлях Ollama: ~/.ollama/models · "
                               "Після зміни — перезапусти Ollama в меню панелі."),
-            lib, self._cdrv_section()])
+            lib] + self._ext_page_extras("models"))
         try:
             self.reload_models(); self._refresh_library()
         except Exception: pass
@@ -3350,12 +3226,20 @@ class SettingsWindow(NSObject):
         cfg = WKWebViewConfiguration.alloc().init()
         try:
             ucc = cfg.userContentController()
-            for nm in ("copy", "speak", "regen", "open", "cdrv", "chat"):
+            for nm in ("copy", "speak", "regen", "open", "ext", "chat"):
                 ucc.removeScriptMessageHandlerForName_(nm)
                 ucc.addScriptMessageHandler_name_(self, nm)
         except Exception:
             pass
-        web = WKWebView.alloc().initWithFrame_configuration_(frame, cfg)
+        try:                                          # 30.09: відео/звук з диска без base64
+            self._fh = _cf.FileSchemeHandler.alloc().init()
+            cfg.setURLSchemeHandler_forURLScheme_(self._fh, _cf.SCHEME)
+        except Exception:
+            self._fh = None
+        web = (_cf.KWebView or WKWebView).alloc().initWithFrame_configuration_(frame, cfg)
+        if _cf.KWebView is not None:                  # файли з Finder ловимо нативно (справжній шлях, без ліміту)
+            web.on_files = self._drop_files
+            web.on_hover = lambda on: self._js("dropHint(%s)" % ("true" if on else "false"))
         web.setNavigationDelegate_(self)
         web.setAutoresizingMask_(18)
         web.setWantsLayer_(True)
@@ -3384,20 +3268,6 @@ class SettingsWindow(NSObject):
             img = img.imageWithSymbolConfiguration_(base) or img
         return img
 
-    @objc.python_method
-    def _sendbtn(self, view, x, y, d):
-        """Кругла кнопка надсилання (↑). Під час генерації морфиться у червоний стоп (⏹)."""
-        b = NSButton.alloc().initWithFrame_(NSMakeRect(x, y, d, d))
-        b.setBordered_(False); b.setTitle_("")
-        b.setTarget_(self); b.setAction_("sendOrStop:")
-        img = self._circle_sym("arrow.up.circle.fill", d,
-                               NSColor.whiteColor(), accent_color())
-        if img:
-            b.setImage_(img); b.setImagePosition_(1)
-        b.setToolTip_("Надіслати"); b.setAutoresizingMask_(33)
-        view.addSubview_(b)
-        return b
-
     # ---------- База знань (RAG) ----------
     @objc.python_method
     def _kb_db_path(self):
@@ -3425,18 +3295,45 @@ class SettingsWindow(NSObject):
         return self._kb
 
     @objc.python_method
-    def _kb_retrieve(self, query):
-        """Топ-K шматків для запиту або "" (тихо, помилку ковтаємо — чат не має падати)."""
+    def _kb_search(self, query):
+        """Відібрані (не слабкі) фрагменти бази для запиту. None — пошук недоступний/впав
+        (чат не має падати, але й «нічого не знайшов» тоді казати не можна); [] — справді нічого схожого."""
         kb = self._kb_get()
         if kb is None:
-            return ""
+            return None
         try:
             import kb as _kbmod
             self._kb_chat_cool()
             hits = kb.search(query, k=6)
-            return _kbmod.build_context(hits)
+            return _kbmod.filter_hits(hits, cosine=getattr(kb, "cosine_scores", True))
         except Exception:
+            return None
+
+    @objc.python_method
+    def _kb_retrieve(self, query, max_chars=2400):
+        """Контекст для системного промту або "" (тихо, помилку ковтаємо)."""
+        hits = self._kb_search(query)
+        if not hits:
             return ""
+        import kb as _kbmod
+        return _kbmod.build_context(hits, max_chars)
+
+    @objc.python_method
+    def _kb_note(self, hits, used=None):
+        """Що показати під відповіддю: {n, src:[{n: імʼя файлу, p: шлях (лише наявний файл)}]}.
+        hits None → n=-1 (пошук не спрацював), [] → n=0 (нічого схожого)."""
+        if hits is None:
+            return {"n": -1, "src": []}
+        used = hits if used is None else used
+        src, seen = [], set()
+        for h in used:
+            path = h.get("path", "") or ""
+            name = os.path.basename(path) or "джерело"
+            if name in seen:
+                continue
+            seen.add(name)
+            src.append({"n": name, "p": path if (os.path.sep in path and os.path.exists(path)) else ""})
+        return {"n": len(used), "src": src}
 
     @objc.python_method
     def _kb_chat_cool(self):
@@ -3468,20 +3365,6 @@ class SettingsWindow(NSObject):
         self.kb_on = not self.kb_on
         cfg = load_cfg(); cfg["kb_on"] = self.kb_on; save_cfg(cfg)
         self._sync_kb()
-
-    def atBtn_(self, sender):
-        # 26.09: «@» у пігулці — вставити @ (якщо поле не вже команда) і відкрити список
-        tv = getattr(self, "chat_input", None)
-        if tv is None: return
-        txt = str(tv.string())
-        if not txt or txt[0] not in "@/":
-            tv.setString_("@")
-            tv.setSelectedRange_(NSMakeRange(1, 0))
-            if getattr(self, "chat_ph", None) is not None:
-                self.chat_ph.setHidden_(True)
-            self._grow_chat_input()
-        self.win.makeFirstResponder_(tv)
-        self._ac_update()
 
     @objc.python_method
     def _sync_kb(self):
@@ -3542,58 +3425,6 @@ class SettingsWindow(NSObject):
             return
         lbl.setStringValue_("❄️ Охолодження SoC %.0f°C — пауза %.0f с (індексація продовжиться)"
                             % (temp, waited))
-
-    @objc.python_method
-    def _spkbtn(self, view, x, y, d):
-        """Гола іконка-динамік у пігулці: вмикає автоозвучку відповідей. Без рамки —
-        колір несе стан (акцент=увімкнено / сірий=вимкнено); керується _sync_spk."""
-        b = NSButton.alloc().initWithFrame_(NSMakeRect(x, y, d, d))
-        b.setBordered_(False); b.setTitle_("")
-        b.setTarget_(self); b.setAction_("autospeakToggled:")
-        cfg = NSImageSymbolConfiguration.configurationWithPointSize_weight_(16.0, 0.0)
-        img = NSImage.imageWithSystemSymbolName_accessibilityDescription_(
-            "speaker.wave.2.fill", "Озвучувати відповіді")
-        if img:
-            img = img.imageWithSymbolConfiguration_(cfg) or img
-            b.setImage_(img); b.setImagePosition_(1)
-        b.setToolTip_("Озвучувати відповіді автоматично")
-        b.setAutoresizingMask_(33)
-        view.addSubview_(b)
-        return b
-
-    @objc.python_method
-    def _kbbtn(self, view, x, y, d):
-        """Тумблер «База знань» у пігулці: акцент=увімкнено. Керується _sync_kb."""
-        b = NSButton.alloc().initWithFrame_(NSMakeRect(x, y, d, d))
-        b.setBordered_(False); b.setTitle_("")
-        b.setTarget_(self); b.setAction_("kbToggled:")
-        cfg = NSImageSymbolConfiguration.configurationWithPointSize_weight_(15.0, 0.0)
-        img = NSImage.imageWithSystemSymbolName_accessibilityDescription_(
-            "books.vertical.fill", "База знань")
-        if img:
-            img = img.imageWithSymbolConfiguration_(cfg) or img
-            b.setImage_(img); b.setImagePosition_(1)
-        b.setAutoresizingMask_(33)
-        view.addSubview_(b)
-        return b
-
-    @objc.python_method
-    def _atbtn(self, view, x, y, d):
-        """Кнопка автодоповнення команд (26.09): «@» у пігулці — клік вставляє
-        «@» і одразу показує список команд (@gpt/@deepseek/@qwen/…)."""
-        b = NSButton.alloc().initWithFrame_(NSMakeRect(x, y, d, d))
-        b.setBordered_(False); b.setTitle_("")
-        b.setTarget_(self); b.setAction_("atBtn:")
-        cfg = NSImageSymbolConfiguration.configurationWithPointSize_weight_(14.0, 0.0)
-        img = NSImage.imageWithSystemSymbolName_accessibilityDescription_(
-            "at", "Куди надіслати: ChatGPT, DeepSeek, Qwen…")
-        if img:
-            img = img.imageWithSymbolConfiguration_(cfg) or img
-            b.setImage_(img); b.setImagePosition_(1)
-        b.setToolTip_("Куди надіслати: ChatGPT, DeepSeek, Qwen…")
-        b.setAutoresizingMask_(33)
-        view.addSubview_(b)
-        return b
 
     @objc.python_method
     def _sync_spk(self):
@@ -3838,11 +3669,9 @@ rm -f "$0"
     def windowDidBecomeKey_(self, n): self._reaccent_segments()
     def windowDidResignKey_(self, n):
         self._reaccent_segments()
-        self._ac_hide()
     def windowDidResize_(self, n):
         try: self._scroll._layout_mask()
         except Exception: pass
-        self._ac_hide()
 
     @objc.python_method
     def _reaccent_segments(self):
@@ -4383,23 +4212,19 @@ rm -f "$0"
     # ---------- чат ----------
     @objc.python_method
     def _refresh_chat_header(self, up=None, timer=False):
-        # 26.09: шапка = лише те, що реально зайняте зараз: моделі в RAM + браузерні чати в роботі.
+        # 26.09: шапка = лише те, що реально зайняте зараз: моделі в RAM + задачі доповнення.
         # timer=True — щосекундний тік: Ollama з кешу, і в сторінку шлемо лише коли щось змінилось.
         if self.web is None:
             return
         age = 3 if timer else 0
         items = []
-        if _cb is not None:
-            for site, d in sorted(cdrv_active().items()):
-                n = d.get("running", 0) + d.get("pending", 0)
-                who = _CDRV_NAMES.get(site, site)
-                if d.get("blocked"):
-                    items.append(("orange", "%s · капча" % who,
-                                  "Браузерний чат %s чекає, поки хтось пройде капчу" % who))
-                if n:
-                    items.append(("blue", "%s · %d" % (who, n),
-                                  "Браузерний чат %s: %d іде, %d чекає в черзі" % (
-                                      who, d.get("running", 0), d.get("pending", 0))))
+        sig = json.dumps(self._chat_cmds())            # список команд змінився → оновити меню @
+        if sig != getattr(self, "_cmds_sig", None):
+            self._cmds_sig = sig; self._js("setCmds(%s)" % sig)
+        ext = self._ext()
+        if ext is not None:
+            try: items.extend(ext.chips())
+            except Exception: pass
         if not (ollama_up() if up is None else up):
             self._push_head({"down": True, "chips": items}, timer)
             return
@@ -4409,15 +4234,12 @@ rm -f "$0"
                    "Нема чат-моделі — завантаж у вкладці «Моделі»")
             self._push_head({"chips": items, "msg": msg}, timer)
             return
-        ram = []
-        for row in ps_loaded(age):
-            name = row.split()[0]
-            if is_embed_model(name):        # 26.09: ембед (bge-m3) — не чат-модель, у шапку не пхаємо
-                continue
-            size = ram_size(row).replace("GB", "ГБ").replace("MB", "МБ").replace(".", ",")
-            ram.append(("green", name.replace(":latest", "") + ("  " + size if size else ""),
-                        "У памʼяті зараз: %s, займає %s RAM" % (name, size or "?")))
-        self._push_head({"chips": ram + items, "msg": "Модель підвантажиться з першим запитом"}, timer)
+        # 30.09: показуємо ВСІ моделі в памʼяті (раніше пошукова тихо ховалась і шапка брехала «одна»)
+        loaded = ps_loaded(age)
+        ram = ram_chips(loaded)
+        if loaded and all(is_embed_model((r.split() or [""])[0]) for r in loaded):
+            ram.append(("gray", "чат-модель ще не в памʼяті", "Завантажиться сама з першим запитом"))
+        self._push_head({"chips": ram + items, "msg": "модель ще не завантажена"}, timer)
 
     @objc.python_method
     def _push_head(self, data, timer):
@@ -4426,40 +4248,6 @@ rm -f "$0"
             return
         self._head_last = js
         self._js(js)
-
-    @objc.python_method
-    def _set_chips(self, items):
-        box = getattr(self, "chat_chips", None)
-        if box is None:
-            return
-        for sv in list(box.subviews()):
-            sv.removeFromSuperview()
-        colors = {"green": NSColor.systemGreenColor(), "blue": NSColor.systemBlueColor(),
-                  "orange": NSColor.systemOrangeColor()}
-        x, h, pad, maxw = 0.0, 20.0, 9.0, box.frame().size.width
-        for color, text, tip in items:
-            f = NSTextField.labelWithString_(text)
-            f.setFont_(NSFont.systemFontOfSize_(11.5))
-            f.setTextColor_(NSColor.labelColor())
-            f.sizeToFit()
-            tw, th = f.frame().size.width, f.frame().size.height
-            w = pad + 6 + 6 + tw + pad
-            if x + w > maxw:                            # не влазить → решту не малюємо, без обрізків
-                break
-            c = NSView.alloc().initWithFrame_(NSMakeRect(x, 1, w, h))
-            c.setWantsLayer_(True)
-            c.layer().setCornerRadius_(h / 2)
-            c.layer().setBackgroundColor_(NSColor.labelColor().colorWithAlphaComponent_(0.07).CGColor())
-            d = NSView.alloc().initWithFrame_(NSMakeRect(pad, (h - 6) / 2, 6, 6))
-            d.setWantsLayer_(True)
-            d.layer().setCornerRadius_(3)
-            d.layer().setBackgroundColor_(colors[color].CGColor())
-            c.addSubview_(d)
-            f.setFrameOrigin_(NSMakePoint(pad + 12, (h - th) / 2))
-            c.addSubview_(f)
-            c.setToolTip_(tip)
-            box.addSubview_(c)
-            x += w + 6
 
     def chatStartOllama_(self, sender):
         if ollama_up():
@@ -4630,7 +4418,22 @@ rm -f "$0"
             return
         a, i = o.get("a"), o.get("i", -1)
         if a == "send":
-            self._send_text(str(o.get("t", "")))
+            self._send_text(str(o.get("t", "")), o.get("att") or [])
+        elif a == "attPick":
+            self._att_pick()
+        elif a == "attData":
+            self._att_data(str(o.get("name", "")), str(o.get("data", "")))
+        elif a == "attDel":
+            self._att_drop(str(o.get("id", "")))
+        elif a == "attPaste":
+            self._att_paste()
+        elif a == "fileSave":
+            self._file_save(str(o.get("p", "")))
+        elif a == "fileReveal":
+            p = str(o.get("p", ""))
+            if os.path.exists(p): subprocess.Popen(["open", "-R", p], start_new_session=True)
+        elif a == "filePrev":
+            self._file_prev(str(o.get("p", "")))
         elif a == "stop":
             self.stopGen_(None)
         elif a == "sel":
@@ -4655,6 +4458,154 @@ rm -f "$0"
         elif a == "ollama":
             self.chatStartOllama_(None)
 
+    # ── вкладення (30.09) ──
+    @objc.python_method
+    def _att_pick(self):
+        p = NSOpenPanel.openPanel()
+        p.setCanChooseFiles_(True); p.setCanChooseDirectories_(False)
+        p.setAllowsMultipleSelection_(True); p.setMessage_("Що додати до запиту?")
+
+        def done(resp):
+            if resp == 1:
+                for u in p.URLs():
+                    self._att_add(str(u.path()))
+        try: p.beginSheetModalForWindow_completionHandler_(self.win, done)
+        except Exception: done(1 if p.runModal() == 1 else 0)
+
+    @objc.python_method
+    def _att_add(self, src, name=None):
+        """Файл → копія в теці вкладень → чіп у полі вводу. У потоці: копія й мініатюра не гальмують UI."""
+        def work():
+            try:
+                if not os.path.isfile(src):
+                    AppHelper.callAfter(self._js, "note('Папку не додати — обери файли')"); return
+                dst = att_store(src, name)
+                rec = {"id": "a%d" % int(time.time() * 1000000), "name": os.path.basename(dst),
+                       "path": dst, "kind": att_kind(dst)}
+                if not hasattr(self, "_atts"): self._atts = {}
+                self._atts[rec["id"]] = rec
+                view = att_view(rec); view["id"] = rec["id"]
+                AppHelper.callAfter(self._js, "attAdded(%s)" % json.dumps(view))
+            except Exception as e:
+                AppHelper.callAfter(self._js, "note(%s)" % json.dumps("Не вдалося додати файл: " + str(e)[:60]))
+        threading.Thread(target=work, daemon=True).start()
+
+    @objc.python_method
+    def _att_data(self, name, b64):
+        """Файл, перетягнутий/вставлений у сторінку (байти з JS) → тимчасовий файл → як звичайне вкладення."""
+        def work():
+            try:
+                raw = base64.b64decode(b64)
+                tmp = tempfile.mkdtemp(prefix="kobzar-att-")
+                p = os.path.join(tmp, os.path.basename(name) or "вставлене")
+                if "." not in os.path.basename(p) and raw[:8] == b"\x89PNG\r\n\x1a\n": p += ".png"
+                with open(p, "wb") as fh: fh.write(raw)
+                self._att_add(p);
+            except Exception as e:
+                AppHelper.callAfter(self._js, "note(%s)" % json.dumps("Не вдалося додати файл: " + str(e)[:60]))
+        threading.Thread(target=work, daemon=True).start()
+
+    @objc.python_method
+    def _drop_files(self, paths):
+        """Нативне перетягування з Finder: справжні шляхи, без ліміту розміру."""
+        for p in paths or []:
+            if os.path.isdir(p):
+                self._js("note('Папку не додати — перетягни файли з неї')")
+            else:
+                self._att_add(p)
+
+    @objc.python_method
+    def _att_paste(self):
+        """Вставка (⌘V) великого файлу/картинки: лише ЧИТАЄМО буфер, нічого в нього не пишемо."""
+        try:
+            pb = NSPasteboard.generalPasteboard()
+            fs = _cf.drop_paths(pb)
+            if fs:
+                self._drop_files(fs); return
+            for typ, ext in (("public.png", ".png"), ("public.tiff", ".tiff"), ("public.jpeg", ".jpg")):
+                data = pb.dataForType_(typ)
+                if data is not None:
+                    tmp = os.path.join(tempfile.mkdtemp(prefix="kobzar-att-"), "вставлене" + ext)
+                    with open(tmp, "wb") as fh: fh.write(bytes(data))
+                    self._att_add(tmp); return
+            self._js("note('У буфері нема файлу чи картинки')")
+        except Exception as e:
+            self._js("note(%s)" % json.dumps("Не вдалося вставити: " + str(e)[:60]))
+
+    @objc.python_method
+    def _file_save(self, path):
+        """«Зберегти оригінал»: вікно збереження (типово — Завантаження); побайтова копія, повна якість."""
+        if not os.path.isfile(path):
+            self._js("note('Файл не знайдено — зберегти нічого')"); return
+        dl = os.path.expanduser("~/Downloads")
+
+        def told(dst):
+            d = os.path.dirname(dst)
+            where = "Завантаження" if os.path.realpath(d) == os.path.realpath(dl) else (os.path.basename(d) or d)
+            self._js("note(%s)" % json.dumps("Збережено в «%s»: %s" % (where, os.path.basename(dst))))
+
+        def copy(dst=None):
+            def work():
+                try:
+                    told(_cf.save_copy(path, dst, dl if dst is None else None))
+                except Exception as e:
+                    self._js("note(%s)" % json.dumps("Не вдалося зберегти: " + str(e)[:60]))
+            threading.Thread(target=work, daemon=True).start()
+        try:
+            from AppKit import NSSavePanel
+            sp = NSSavePanel.savePanel()
+            sp.setNameFieldStringValue_(os.path.basename(path))
+            sp.setDirectoryURL_(NSURL.fileURLWithPath_(dl))
+            sp.setMessage_("Куди зберегти оригінал?")
+
+            def done(resp):
+                if resp == 1 and sp.URL() is not None:
+                    copy(str(sp.URL().path()))
+            sp.beginSheetModalForWindow_completionHandler_(self.win, done)
+        except Exception:
+            copy()                                   # нема вікна збереження — тиха копія в Завантаження з повідомленням
+
+    @objc.python_method
+    def _file_prev(self, path):
+        """Текст для розгортання в чаті: перші ~40 рядків + повний (до 200 КБ). Лише текстові типи."""
+        def work():
+            try:
+                if not os.path.isfile(path) or _cf.kind_of(path) not in _cf.TEXT_KINDS:
+                    o = {"err": "Цей файл не можна переглянути тут — відкрий його кнопкою «Відкрити»"}
+                else:
+                    o = _cf.preview(path)
+            except Exception as e:
+                o = {"err": "Не вдалося прочитати файл: " + str(e)[:60]}
+            self._js("filePrevSet(%s,%s)" % (json.dumps(path), json.dumps(o)))
+        threading.Thread(target=work, daemon=True).start()
+
+    @objc.python_method
+    def _att_drop(self, aid):
+        """Чіп прибрали до надсилання → видалити нашу копію (оригінал не чіпаємо)."""
+        rec = getattr(self, "_atts", {}).pop(aid, None)
+        if rec:
+            try: os.remove(rec["path"])
+            except Exception: pass
+
+    @objc.python_method
+    def _att_restore(self, atts):
+        """Надсилання не відбулось → чіпи назад у поле (файли вже скопійовані)."""
+        for a in atts or []:
+            rec = dict(a, id="a%d" % int(time.time() * 1000000))
+            if not hasattr(self, "_atts"): self._atts = {}
+            self._atts[rec["id"]] = rec
+            view = att_view(rec); view["id"] = rec["id"]
+            self._js("attAdded(%s)" % json.dumps(view))
+
+    @objc.python_method
+    def _att_take(self, ids):
+        """id чіпів → записи вкладень (забирає з очікуючих)."""
+        out = []
+        for i in ids or []:
+            r = getattr(self, "_atts", {}).pop(str(i), None)
+            if r: out.append({"name": r["name"], "path": r["path"], "kind": r["kind"]})
+        return out
+
     @objc.python_method
     def _rename_idx(self, r, t):
         t = t.strip()
@@ -4677,8 +4628,12 @@ rm -f "$0"
     @objc.python_method
     def _push_all(self):
         """Сторінка чату щойно завантажилась → віддати їй увесь стан."""
-        cmds = [[t, d] for t, d, need in _AC_CMDS if not need or _cb is not None]
-        self._js("setBoot(%s)" % json.dumps({"cb": _cb is not None, "cmds": cmds}))
+        cmds = self._chat_cmds(); self._cmds_sig = json.dumps(cmds)
+        ext = self._ext()
+        if ext is not None:
+            try: self._js(ext.page_js())
+            except Exception: pass
+        self._js("setBoot(%s)" % json.dumps({"ext": ext is not None, "cmds": cmds}))
         self._reload_hist(); self._push_toggles()
         self._gen_ui(getattr(self, "_generating", False))
         self._render_session(); self._refresh_chat_header()
@@ -4699,15 +4654,14 @@ rm -f "$0"
                 p = str(txt)
                 if p and os.path.exists(p):               # лише реальний наявний шлях
                     # .json/.log/… часто без зареєстрованого GUI-обробника — `open p` тоді
-                    # мовчки нічого не робить (LaunchServices не знає, чим відкрити).
-                    # -t форсує дефолтний текстовий редактор для такого plain-text.
-                    ext = os.path.splitext(p)[1].lower()
-                    cmd = ["open", "-t", p] if ext in (".json", ".yaml", ".yml") else ["open", p]
-                    subprocess.Popen(cmd, start_new_session=True)
+                    # мовчки нічого не робить → -t (текстовий редактор). Запускні типи
+                    # (.app/.command/.sh…) не запускаємо — лише показуємо у Finder (chatfiles.open_cmd).
+                    subprocess.Popen(_cf.open_cmd(p), start_new_session=True)
             elif name == "regen":
                 self._regen_last()                        # «Ще раз» — перегенерувати
-            elif name == "cdrv":                          # кнопки плану браузерних чатів
-                self._cdrv_button(str(txt))
+            elif name == "ext":                           # кнопки карток доповнення
+                ext = self._ext()
+                if ext is not None: ext.on_message(str(txt))
             else:                                         # copy
                 pb = NSPasteboard.generalPasteboard()
                 pb.clearContents()
@@ -4727,8 +4681,8 @@ rm -f "$0"
             self._js("note('Ollama не запущена')"); return
         sess = self.sessions[self.cur]
         h = sess["history"]
-        if h and h[-1].get("cdrv"):                       # відповідь браузерного чату — не Ollama
-            self._js("note('це відповідь браузерного чату: /повторити <id>')"); return
+        if h and self._ext_owns(h[-1]):                   # відповідь доповнення — не Ollama
+            self._js("note(%s)" % json.dumps(self._ext().regen_note())); return
         if h and h[-1]["role"] == "assistant":
             h.pop()                                       # викинути попередню відповідь
         if not (h and h[-1]["role"] == "user"):
@@ -4774,6 +4728,11 @@ rm -f "$0"
     def webView_didFailProvisionalNavigation_withError_(self, web, nav, error):
         self._nav_failed(web)
 
+    def webViewWebContentProcessDidTerminate_(self, web):
+        # 30.09.2026: під свопом macOS вбиває веб-процес (jetsam) — чат лишається БІЛИМ
+        # без жодної помилки навігації. Піднімаємо сторінку заново й малюємо історію.
+        self._nav_failed(web)
+
     @objc.python_method
     def _nav_failed(self, web):
         if web is getattr(self, "set_web", None) or web is not getattr(self, "web", None):
@@ -4800,17 +4759,22 @@ rm -f "$0"
         arr = []
         for m in sess["history"]:
             if m["role"] == "user":
-                arr.append({"r": "user", "c": m["content"]})
-            elif m.get("cdrv"):
-                who, body = _cdrv_split(m["content"])
-                arr.append({"r": "ai", "c": _embed_local_media(body), "m": who, "x": 1})
+                u = {"r": "user", "c": m["content"]}
+                if m.get("att"): u["att"] = [att_view(x) for x in m["att"]]
+                if m.get("fn"): u["fn"] = m["fn"]
+                arr.append(u)
+            elif self._ext_owns(m):
+                arr.append(self._ext().render(m))
             else:
-                arr.append({"r": "ai", "c": m["content"]})
+                a = {"r": "ai", "c": m["content"]}
+                if isinstance(m.get("kb"), dict): a["kb"] = m["kb"]
+                arr.append(a)
         self._js("loadMsgs(%s)" % json.dumps(arr))
         self._js("setTitle(%s)" % json.dumps(sess.get("title", "")))
-        for jid, (sid, who, st) in list(getattr(self, "_cdrv_live", {}).items()):
-            if sid == sess.get("id"):
-                self._js("jobCard(%s,%s,%s)" % (json.dumps(jid), json.dumps(who), json.dumps(st)))
+        ext = self._ext()
+        if ext is not None:
+            try: ext.restore_ui(sess)
+            except Exception: pass
 
     @objc.python_method
     def _sid_index(self, sid):
@@ -4880,260 +4844,29 @@ rm -f "$0"
         self.ctx_num.setStringValue_(CTX_OPTS[i])
         cfg = load_cfg(); cfg["num_ctx"] = int(CTX_OPTS[i]); save_cfg(cfg)
 
-    def textDidChange_(self, note):
-        # ховати плейсхолдер коли є текст
-        if getattr(self, "chat_ph", None) is not None:
-            try: self.chat_ph.setHidden_(len(str(self.chat_input.string())) > 0)
-            except Exception: pass
-        self._grow_chat_input()
-        self._ac_update()          # 26.09: підказки @/… під поточний перший токен
-
-    @objc.python_method
-    def _grow_chat_input(self):
-        """Авто-зріст поля чату (як iMessage): пігулка росте до ~5 рядків, далі скрол."""
-        tv = getattr(self, "chat_input", None)
-        sc = getattr(self, "chat_sc", None)
-        pill = getattr(self, "chat_pill", None)
-        if tv is None or sc is None or pill is None: return
-        holder = sc.superview()
-        if holder is None: return
-        try:
-            CW = holder.bounds().size.width
-            M = LP_M
-            x0 = M + LP_SBW + LP_SBG      # та сама геометрія, що в _build_chat
-            cw = CW - x0 - M
-            lm = tv.layoutManager(); tc = tv.textContainer()
-            lm.ensureLayoutForTextContainer_(tc)
-            used = lm.usedRectForTextContainer_(tc).size.height
-            line = 19.0
-            content = max(line, used) + 8.0          # + вертикальний inset
-            in_h = max(26.0, min(content, 26.0 + 4 * line))   # 1..~5 рядків
-            at_max = in_h >= 26.0 + 4 * line - 0.5
-            pill_h = in_h + 14.0
-            pill_y = 14.0
-            send_d = 30
-            sx = CW - M - 9 - send_d
-            spk_d = 28
-            spk_x = sx - 6 - spk_d
-            kb_d = 26
-            kb_x = spk_x - 4 - kb_d
-            at_d = 26
-            at_x = kb_x - 4 - at_d
-            in_x = x0 + 16
-            in_w = at_x - 10 - in_x
-            pill.setFrame_(NSMakeRect(x0, pill_y, cw, pill_h))
-            if self.send_btn is not None:
-                self.send_btn.setFrame_(NSMakeRect(sx, pill_y + (pill_h - send_d) / 2.0, send_d, send_d))
-            if getattr(self, "autospeak", None) is not None:
-                self.autospeak.setFrame_(NSMakeRect(spk_x, pill_y + (pill_h - spk_d) / 2.0, spk_d, spk_d))
-            if getattr(self, "chat_kb", None) is not None:
-                self.chat_kb.setFrame_(NSMakeRect(kb_x, pill_y + (pill_h - kb_d) / 2.0, kb_d, kb_d))
-            if getattr(self, "chat_at", None) is not None:
-                self.chat_at.setFrame_(NSMakeRect(at_x, pill_y + (pill_h - at_d) / 2.0, at_d, at_d))
-            sc.setFrame_(NSMakeRect(in_x, pill_y + (pill_h - in_h) / 2.0, in_w, in_h))
-            sc.setHasVerticalScroller_(at_max)
-            if getattr(self, "chat_ph", None) is not None:
-                self.chat_ph.setFrame_(NSMakeRect(in_x + 4, pill_y + (pill_h - 18) / 2.0, in_w - 8, 18))
-            if getattr(self, "web", None) is not None:   # веб над пігулкою — піднімаємо/опускаємо низ
-                f = self.web.frame()
-                top = f.origin.y + f.size.height
-                tr_bottom = pill_y + pill_h + 12
-                self.web.setFrame_(NSMakeRect(x0, tr_bottom, cw, top - tr_bottom))
-        except Exception:
-            pass
-
-    # ═══ автодоповнення команд @/… у чаті (26.09) ══════════════════════════
-    @objc.python_method
-    def _ac_update(self):
-        """Перерахувати підказки під поточний текст/курсор і показати/сховати список."""
-        tv = getattr(self, "chat_input", None)
-        if tv is None: return
-        txt = str(tv.string())
-        try: caret = tv.selectedRange().location
-        except Exception: caret = len(txt)
-        items = _ac_matches(txt[:caret], _cb is not None)
-        if not items:
-            if self._ac_open: self._ac_hide()
-            return
-        self._ac_items = items
-        self._ac_idx = min(self._ac_idx, len(items) - 1) if self._ac_open else 0
-        self._ac_show()
-
-    @objc.python_method
-    def _ac_ensure_panel(self):
-        if self._ac_panel is not None:
-            return
-        panel = NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
-            NSMakeRect(0, 0, 300, 40), NSWindowStyleMaskNonactivatingPanel,
-            NSBackingStoreBuffered, False)
-        panel.setOpaque_(False); panel.setBackgroundColor_(NSColor.clearColor())
-        panel.setHasShadow_(True); panel.setHidesOnDeactivate_(False)
-        try: panel.setLevel_(NSFloatingWindowLevel)
-        except Exception: pass
-        eff = NSVisualEffectView.alloc().initWithFrame_(NSMakeRect(0, 0, 300, 40))
-        eff.setMaterial_(NSVisualEffectMaterialWindowBackground)
-        eff.setBlendingMode_(NSVisualEffectBlendingModeBehindWindow)
-        eff.setState_(NSVisualEffectStateActive)
-        try:
-            eff.setWantsLayer_(True)
-            eff.layer().setCornerRadius_(10.0); eff.layer().setMasksToBounds_(True)
-            eff.layer().setBorderWidth_(1.0)
-            eff.layer().setBorderColor_(NSColor.separatorColor().CGColor())
-        except Exception: pass
-        panel.setContentView_(eff)
-        self._ac_panel = panel
-        self._ac_content = eff
-
-    @objc.python_method
-    def _ac_make_row(self, tok, desc, w, h):
-        row = _ACRow.alloc().initWithFrame_(NSMakeRect(0, 0, w, h))
-        attr = NSMutableAttributedString.alloc().initWithString_(tok + "   ")
-        attr.addAttribute_value_range_(NSFontAttributeName, NSFont.boldSystemFontOfSize_(12.5),
-                                       NSMakeRange(0, len(tok)))
-        d = NSAttributedString.alloc().initWithString_attributes_(
-            desc, {NSFontAttributeName: NSFont.systemFontOfSize_(12.0),
-                   NSForegroundColorAttributeName: NSColor.secondaryLabelColor()})
-        attr.appendAttributedString_(d)
-        row.setAttributedStringValue_(attr)
-        try:
-            row.cell().setLineBreakMode_(4); row.setLineBreakMode_(4)
-        except Exception: pass
-        return row
-
-    @objc.python_method
-    def _ac_show(self):
-        """Побудувати/оновити список підказок і показати панель НАД полем вводу."""
-        self._ac_ensure_panel()
-        for r in self._ac_rows:
-            r.removeFromSuperview()
-        self._ac_rows = []
-        ROWH, PAD, W = 28.0, 5.0, 300.0
-        n = len(self._ac_items)
-        h = n * ROWH + PAD * 2
-        self._ac_panel.setFrame_display_(NSMakeRect(0, 0, W, h), False)
-        for i, (tok, desc) in enumerate(self._ac_items):
-            row = self._ac_make_row(tok, desc, W - 2 * PAD, ROWH - 2)
-            y = h - PAD - (i + 1) * ROWH + 1
-            row.setFrame_(NSMakeRect(PAD, y, W - 2 * PAD, ROWH - 2))
-            row.setOwnerIdx_((self, i))
-            self._ac_content.addSubview_(row)
-            self._ac_rows.append(row)
-        self._ac_highlight()
-        self._ac_position()
-        if not self._ac_open:
-            self.win.addChildWindow_ordered_(self._ac_panel, 1)   # NSWindowAbove
-        self._ac_panel.orderFront_(None)
-        self._ac_open = True
-
-    @objc.python_method
-    def _ac_position(self):
-        """Позиціювати панель НАД пігулкою вводу (input — унизу вікна)."""
-        pill = getattr(self, "chat_pill", None)
-        if pill is None or self.win is None: return
-        try:
-            rect_win = pill.convertRect_toView_(pill.bounds(), None)
-            rect_scr = self.win.convertRectToScreen_(rect_win)
-        except Exception:
-            return
-        pf = self._ac_panel.frame()
-        x = rect_scr.origin.x
-        y = rect_scr.origin.y + rect_scr.size.height + 6
-        try:
-            scr = self.win.screen() or NSScreen.mainScreen()
-            sf = scr.visibleFrame()
-            x = max(sf.origin.x + 4, min(x, sf.origin.x + sf.size.width - pf.size.width - 4))
-        except Exception: pass
-        self._ac_panel.setFrameOrigin_(NSMakePoint(x, y))
-
-    @objc.python_method
-    def _ac_highlight(self):
-        for i, row in enumerate(self._ac_rows):
-            row.setPicked_(i == self._ac_idx)
-
-    @objc.python_method
-    def _ac_move(self, d):
-        if not self._ac_items: return
-        n = len(self._ac_items)
-        self._ac_idx = max(0, min(n - 1, self._ac_idx + d))
-        self._ac_highlight()
-
-    @objc.python_method
-    def _ac_pick(self, idx):
-        self._ac_idx = idx
-        self._ac_accept()
-
-    @objc.python_method
-    def _ac_accept(self):
-        """Enter/Tab/клік на вибраному рядку: вставити токен+пробіл, закрити список."""
-        if not self._ac_items:
-            self._ac_hide(); return
-        idx = max(0, min(self._ac_idx, len(self._ac_items) - 1))
-        tok = self._ac_items[idx][0]
-        tv = self.chat_input
-        try: caret = tv.selectedRange().location
-        except Exception: caret = len(str(tv.string()))
-        rest = str(tv.string())[caret:]
-        tv.setString_(tok + " " + rest)
-        tv.setSelectedRange_(NSMakeRange(len(tok) + 1, 0))
-        self._ac_hide()
-        self._grow_chat_input()
-        if getattr(self, "chat_ph", None) is not None:
-            self.chat_ph.setHidden_(len(str(tv.string())) > 0)
-
-    @objc.python_method
-    def _ac_hide(self):
-        self._ac_open = False
-        self._ac_items = []
-        panel = self._ac_panel
-        if panel is not None:
-            try: self.win.removeChildWindow_(panel)
-            except Exception: pass
-            panel.orderOut_(None)
-
-    def textView_doCommandBySelector_(self, tv, sel):
-        # 26.09: поки список автодоповнення відкритий — стрілки/Enter/Tab/Esc керують НИМ,
-        # а не курсором/надсиланням (інакше Enter надсилав би недописану команду).
-        if getattr(self, "_ac_open", False):
-            if sel == "moveUp:":
-                self._ac_move(-1); return True
-            if sel == "moveDown:":
-                self._ac_move(1); return True
-            if sel in ("insertNewline:", "insertTab:"):
-                self._ac_accept(); return True
-            if sel == "cancelOperation:":
-                self._ac_hide(); return True
-        # Enter → надіслати; Shift+Enter → новий рядок
-        if sel == "insertNewline:":
-            ev = NSApp.currentEvent()
-            if ev is not None and (ev.modifierFlags() & (1 << 17)):  # Shift
-                tv.insertNewlineIgnoringFieldEditor_(None)
-                return True
-            self.sendChat_(tv)
-            return True
-        return False
-
     def sendChat_(self, sender):
         pass                                   # 26.09: ввід живе на сторінці → _send_text
 
     @objc.python_method
-    def _send_text(self, txt):
+    def _send_text(self, txt, att=None):
         txt = (txt or "").strip()
         if not txt: return
-        if _cb is not None and not getattr(self, "_generating", False):
-            cmd = _cb.parse(txt)
-            if cmd is None and getattr(self, "_cdrv_pending", None) and \
-                    txt.lower().strip(" .!") in ("так", "го", "пуск", "пусти", "/go"):
-                cmd = {"kind": "go"}
-            if cmd is not None:                       # браузерні чати: Ollama не потрібна
-                self._cdrv_send(txt, cmd); return
+        atts = self._att_take(att)
+        ext = self._ext()
+        if ext is not None and not getattr(self, "_generating", False):
+            cmd = ext.parse(txt)
+            if cmd is not None:                       # команда доповнення: Ollama не потрібна
+                ext.send(txt, cmd, atts); return
         model = self.panel.current_model()
         # Чат-моделі нема, але База знань увімкнена → чистий семантичний режим:
         # запит → ембед (bge-m3) → топ-фрагменти як відповідь, LLM не потрібна
         kb_only = (not model) and self.kb_on and bool(self.kb_index or self.kb_folder)
         if not model and not kb_only:
+            self._att_restore(atts)
             self._js("inputRestore(%s)" % json.dumps(txt))
             self._js("note('Нема чат-моделі — завантаж у вкладці «Моделі»')"); return
         if not ollama_up():
+            self._att_restore(atts)
             self._js("inputRestore(%s)" % json.dumps(txt))
             self._js("note('Ollama не запущена — кнопка «Запустити» вгорі')"); return
         if self.autospeak_on and tts_mode() == "realtime" and not self._ram_warned:
@@ -5151,9 +4884,11 @@ rm -f "$0"
         self.sessions.sort(key=lambda s: s.get("ts", 0), reverse=True)
         self.cur = self._sid_index(sid)
         self._reload_hist()
-        self._js("addUser(%s)" % json.dumps(txt))
+        self._js("addUser(%s,%s)" % (json.dumps(txt), json.dumps([att_view(x) for x in atts])))
+        if atts and kb_only:
+            self._js("attNote(%s)" % json.dumps(["База знань не читає вкладення — файли не використано"]))
         self._js("aiStart()")
-        sess["history"].append({"role": "user", "content": txt})
+        sess["history"].append({"role": "user", "content": txt, **({"att": atts} if atts else {})})
         save_chat(sess)                                # фіксуємо на диск (чат вже існує)
         self.gen_cancel = threading.Event()
         self._gen_ui(True)                              # send → червоний стоп (⏹) на час генерації
@@ -5161,138 +4896,6 @@ rm -f "$0"
             threading.Thread(target=self._kb_only_worker, args=(sess,), daemon=True).start()
         else:
             threading.Thread(target=self._worker, args=(model, sess, self.gen_cancel), daemon=True).start()
-
-    # ═══ браузерні чати через chatdrv (26.09.2026) ═══════════════════════
-    @objc.python_method
-    def _cdrv_send(self, txt, cmd):
-        sess = self.sessions[self.cur]
-        sess.setdefault("id", str(int(time.time() * 1000)))
-        sid = sess["id"]
-        sess["ts"] = time.time()
-        if not sess["history"]:
-            sess["title"] = (txt[:20] + "…") if len(txt) > 20 else txt
-        self.sessions.sort(key=lambda s: s.get("ts", 0), reverse=True)
-        self.cur = self._sid_index(sid)
-        self._reload_hist()
-        self._js("addUser(%s)" % json.dumps(txt))
-        sess["history"].append({"role": "user", "content": txt, "cdrv": 1})
-        save_chat(sess)
-        threading.Thread(target=self._cdrv_worker, args=(sid, cmd), daemon=True).start()
-
-    @objc.python_method
-    def _cdrv_button(self, what):
-        pend = getattr(self, "_cdrv_pending", None)
-        if not pend:
-            return
-        if what == "drop":
-            self._cdrv_pending = None
-            self._cdrv_say(pend[0], "План не запускав.")
-        elif what == "go":
-            threading.Thread(target=self._cdrv_worker, args=(pend[0], {"kind": "go"}),
-                             daemon=True).start()
-
-    @objc.python_method
-    def _cdrv_worker(self, sid, cmd):
-        k = cmd["kind"]
-        try:
-            if k == "help":
-                self._cdrv_say(sid, _cb.HELP)
-            elif k == "queue":
-                self._cdrv_say(sid, _cb.queue_text())
-            elif k == "cancel":
-                self._cdrv_say(sid, _cb.cancel(cmd["arg"]))
-            elif k == "result":
-                self._cdrv_say(sid, _cb.result_text(_cb.job(cmd["arg"])))
-            elif k == "retry":
-                self._cdrv_say(sid, _cb.retry(cmd["arg"]))
-                if cmd["arg"].startswith("j"):
-                    self._cdrv_watch(sid, [(cmd["arg"], "")])
-            elif k == "plan":
-                jobs = _cb.plan(cmd)
-                self._cdrv_pending = (sid, jobs)
-                self._cdrv_say(sid, _cb.plan_text(jobs), plan=True)
-            elif k == "go":
-                pend, self._cdrv_pending = getattr(self, "_cdrv_pending", None), None
-                if not pend:
-                    self._cdrv_say(sid, "Нема плану для запуску."); return
-                # 26.09: розмова Кобзаря = свій тред у кожному сайті, щоб дописування
-                # йшло в той самий браузерний чат, а не відкривало новий
-                for j in pend[1]:
-                    if not j.get("thread"):
-                        j["thread"] = "kobzar-%s" % pend[0]
-                ids = _cb.launch(pend[1])
-                self._cdrv_watch(pend[0], ids)
-        except Exception as e:
-            self._cdrv_say(sid, "Міст до браузерних чатів зламався: %s: %s" % (
-                type(e).__name__, str(e)[:200]))
-
-    @objc.python_method
-    def _cdrv_say(self, sid, text, plan=False):
-        def _do():
-            i = self._sid_index(sid)
-            if i < 0:                                   # чат видалили — не воскрешати
-                return
-            sess = self.sessions[i]
-            sess["history"].append({"role": "assistant", "content": text, "cdrv": 1})
-            save_chat(sess)                              # у файлі — сирий текст, без base64
-            if i == self.cur:
-                if plan:
-                    self._js("cdrvPlan(%s)" % json.dumps(text))
-                else:
-                    who, body = _cdrv_split(text)
-                    self._js("addAI(%s,%s,false)" % (json.dumps(_embed_local_media(body)),
-                                                    json.dumps(who)))
-        AppHelper.callAfter(_do)
-
-    @objc.python_method
-    def _cdrv_watch(self, sid, ids):
-        """Опитує JSON задач; поки йде — жива картка в чаті; готове кладе в той чат, звідки пустили."""
-        live = getattr(self, "_cdrv_live", None)
-        if live is None:
-            self._cdrv_live = live = {}
-
-        def card(jid, who, st):
-            def _do():
-                if jid not in live and st != "new":
-                    return
-                live[jid] = (sid, who, "pending" if st == "new" else st)
-                i = self._sid_index(sid)
-                if i >= 0 and i == self.cur:
-                    self._js("jobCard(%s,%s,%s)" % (json.dumps(jid), json.dumps(who),
-                                                    json.dumps(live[jid][2])))
-            AppHelper.callAfter(_do)
-
-        def done(jid):
-            def _do():
-                live.pop(jid, None)
-                self._js("jobDone(%s)" % json.dumps(jid))
-            AppHelper.callAfter(_do)
-
-        def _loop():
-            left = dict(ids); t0 = time.time(); seen = {}
-            for jid, site in left.items():
-                card(jid, _cb.NAMES.get(site, site) or "Браузерний чат", "new")
-            while left and time.time() - t0 < 3600:
-                time.sleep(4)
-                for jid in list(left):
-                    j = _cb.job(jid)
-                    if not j:
-                        continue
-                    st = j.get("status")
-                    if st in _cb.FINAL:
-                        left.pop(jid)
-                        done(jid)
-                        self._cdrv_say(sid, _cb.result_text(j))
-                    elif st != seen.get(jid):
-                        seen[jid] = st
-                        who = _cb.NAMES.get(j.get("site"), j.get("site")) or "Браузерний чат"
-                        card(jid, who, st)
-            for jid in left:
-                done(jid)
-            if left:
-                self._cdrv_say(sid, "За годину не дописали: " + ", ".join(
-                    "`%s`" % i for i in left) + ". Забрати пізніше: `/результат <id>`.")
-        threading.Thread(target=_loop, daemon=True).start()
 
     @objc.python_method
     def _kb_only_worker(self, sess):
@@ -5304,8 +4907,9 @@ rm -f "$0"
             kb = self._kb_get()
             if kb is None:
                 self._js("aiEnd()"); self._js("note('база знань недоступна')"); return
-            self._kb_chat_cool()
-            hits = kb.search(last_user, k=6)
+            hits = self._kb_search(last_user)
+            if hits is None:
+                self._js("aiEnd()"); self._js("note('пошук по базі не спрацював')"); return
             if not hits:
                 full = "Нічого не знайшов у базі знань за цим запитом."
                 self._js("aiAppend(%s)" % json.dumps(full))
@@ -5338,20 +4942,41 @@ rm -f "$0"
             _cfg = load_cfg()
             np = int(_cfg.get("num_predict", 2048))
             nctx = int(_cfg.get("num_ctx", 4096))
-            # відповіді браузерних чатів (cdrv) у локальну модель не йдуть — лише її розмова
+            # відповіді доповнення у локальну модель не йдуть — лише її власна розмова
             messages = [{"role": m["role"], "content": m["content"]}
-                        for m in sess["history"] if not m.get("cdrv")]
+                        for m in sess["history"] if not self._ext_owns(m)]
+            # 30.09: вкладення останнього запиту → текст/картинки в цей хід + чесні рядки під повідомленням.
+            # Історію не мутуємо (у ній лишаються лише шляхи), раніші файли — лише назвою.
+            last = sess["history"][-1] if sess["history"] else None
+            if last is not None and last.get("role") == "user" and last.get("att"):
+                import kb as _kbf
+                fctx = _cf.local_context(last["att"], _kbf.context_budget(nctx),
+                                         _cf.model_has_vision(model, OLLAMA_HOST), _cf.image_b64)
+                extra = fctx["text"]
+                if messages and messages[-1]["role"] == "user":
+                    if extra: messages[-1]["content"] = (messages[-1]["content"] + "\n\n" + extra).strip()
+                    if fctx["images"]: messages[-1]["images"] = fctx["images"]
+                if fctx["notes"] and not last.get("fn"):
+                    last["fn"] = fctx["notes"]
+                    if sess in self.sessions: save_chat(sess)
+                    self._js("attNote(%s)" % json.dumps(fctx["notes"]))
             # База знань: ретрів по останньому запиту → системний контекст спереду.
             # Не мутуємо збережену історію — лише те, що йде в модель цього разу.
+            kb_note = None
             if self.kb_on:
                 last_user = next((m["content"] for m in reversed(sess["history"])
                                   if m.get("role") == "user"), "")
-                ctx = self._kb_retrieve(last_user) if last_user else ""
-                if ctx:
-                    preamble = ("Ти відповідаєш, спираючись на наведені фрагменти з бази "
-                                "знань користувача. Якщо відповіді в них немає — так і скажи, "
-                                "не вигадуй.\n\n=== БАЗА ЗНАНЬ ===\n" + ctx)
-                    messages = [{"role": "system", "content": preamble}] + messages
+                if last_user:
+                    import kb as _kbmod
+                    hits = self._kb_search(last_user)
+                    used = _kbmod.select_for_context(hits, _kbmod.context_budget(nctx)) if hits else []
+                    kb_note = self._kb_note(hits, used)
+                    if used:
+                        preamble = KB_PREAMBLE + _kbmod.build_context(used, _kbmod.context_budget(nctx))
+                        # розмова + фрагменти мають вміститись у вікно контексту разом із відповіддю
+                        left = int((nctx - min(np, nctx // 2)) * KB_CHARS_PER_TOKEN) - len(preamble)
+                        messages = [{"role": "system", "content": preamble}] + \
+                            _kbmod.trim_history(messages, max(1500, left))
             payload = json.dumps({"model": model, "messages": messages, "stream": True,
                                   "think": False,
                                   "options": {"num_predict": np, "num_ctx": nctx,
@@ -5389,10 +5014,12 @@ rm -f "$0"
                 tail = "".join(acc)[spoken:].strip()
                 if tail and not stopped: self.panel._live_feed(live_gen, tail)
                 self.panel._live_end(live_gen)
+            akb = {"kb": kb_note} if kb_note else {}
             if stopped:
                 if full:
-                    sess["history"].append({"role": "assistant", "content": full})
+                    sess["history"].append({"role": "assistant", "content": full, **akb})
                     if sess in self.sessions: save_chat(sess)   # видалений під час генерації — не воскрешати
+                if full and kb_note: self._js("aiKb(%s)" % json.dumps(kb_note))
                 self._js("aiEnd()")
                 self._js("note('зупинено')")
                 return
@@ -5402,8 +5029,9 @@ rm -f "$0"
                 self._js("aiAppend(%s)" % json.dumps(hint))
                 self._js("aiEnd()")
                 return
-            sess["history"].append({"role": "assistant", "content": full})
+            sess["history"].append({"role": "assistant", "content": full, **akb})
             if sess in self.sessions: save_chat(sess)   # видалений під час генерації — не воскрешати
+            if kb_note: self._js("aiKb(%s)" % json.dumps(kb_note))
             self._js("aiEnd()")
             if self.autospeak_on and not realtime:     # base/stream — озвучити по завершенні
                 AppHelper.callAfter(lambda: self.panel._speak(full))
@@ -5418,48 +5046,6 @@ rm -f "$0"
         finally:
             AppHelper.callAfter(self._gen_ui, False)    # будь-який вихід → send назад у ↑
 
-    @objc.python_method
-    def _append(self, s, bold=False, color=None):
-        tv = self.chat_view
-        if tv is None: return
-        font = NSFont.boldSystemFontOfSize_(13.0) if bold else NSFont.systemFontOfSize_(13.0)
-        attrs = {NSFontAttributeName: font,
-                 NSForegroundColorAttributeName: color or NSColor.labelColor()}
-        self._append_attr(s, attrs)
-
-    @objc.python_method
-    def _append_attr(self, s, attrs):
-        tv = self.chat_view
-        if tv is None: return
-        st = tv.textStorage()
-        st.beginEditing()
-        st.appendAttributedString_(NSAttributedString.alloc().initWithString_attributes_(s, attrs))
-        st.endEditing()
-        tv.scrollRangeToVisible_(NSMakeRange(st.length(), 0))
-
-    # ── месенджер-бульбашки: користувач справа (акцент), AI зліва (нейтрально) ──
-    @objc.python_method
-    def _bubble_attrs(self, role):
-        ps = NSMutableParagraphStyle.alloc().init()
-        ps.setLineSpacing_(2.0)
-        ps.setParagraphSpacing_(8.0)
-        ps.setParagraphSpacingBefore_(2.0)
-        if role == "user":
-            ps.setAlignment_(1)            # right
-            ps.setHeadIndent_(90.0); ps.setFirstLineHeadIndent_(90.0); ps.setTailIndent_(-6.0)
-            bg = accent_color().colorWithAlphaComponent_(0.16)
-        else:
-            ps.setAlignment_(0)            # left
-            ps.setHeadIndent_(6.0); ps.setFirstLineHeadIndent_(6.0); ps.setTailIndent_(-90.0)
-            bg = NSColor.secondaryLabelColor().colorWithAlphaComponent_(0.10)
-        return {NSFontAttributeName: NSFont.systemFontOfSize_(13.0),
-                NSForegroundColorAttributeName: NSColor.labelColor(),
-                NSParagraphStyleAttributeName: ps,
-                NSBackgroundColorAttributeName: bg}
-
-    @objc.python_method
-    def _bubble(self, role, text):
-        self._append_attr("  " + text.strip() + "  \n\n", self._bubble_attrs(role))
 
     @objc.python_method
     def refresh(self, up=None):
@@ -5541,7 +5127,7 @@ class Panel(rumps.App):
         self._cooling = None            # стан термо-паузи з thermal.py (будь-який процес) → трей
         self.menu = [
             "mem_line", "thermal_line",
-            rumps.MenuItem("Модель у RAM:"), "loaded_line", None,
+            rumps.MenuItem("Модель у RAM:"), "loaded_line", "loaded_line2", "loaded_line3", None,
             "hdr_voice",
             "speak_sel", "speak_clip", "tts_pause", "tts_stop", None,
             "hdr_services",
@@ -5555,6 +5141,9 @@ class Panel(rumps.App):
         self.menu["ollama_reason"]._menuitem.setHidden_(True)
         self.menu["thermal_line"].title = ""
         self.menu["thermal_line"]._menuitem.setHidden_(True)   # видно лише під час термо-паузи
+        for _k in ("loaded_line2", "loaded_line3"):            # 2-га/3-тя модель в RAM: спершу сховані
+            self.menu[_k].title = ""
+            self.menu[_k]._menuitem.setHidden_(True)
         self._sym_cache = {}  # кеш SF Symbol-іконок меню (template, під колір тексту меню)
         # секційні заголовки — нативний стиль: жирний дрібний напис вторинним кольором,
         # без callback (сірий/неклікабельний). Без ASCII-рамки «— … —».
@@ -5750,6 +5339,17 @@ class Panel(rumps.App):
             self._sym_cache[name] = img
         return img
 
+    def _paint_ram_lines(self, loaded):
+        """Меню трея: усі моделі в RAM (до 3) окремими сірими рядками."""
+        head, rows = ram_menu_lines(loaded)
+        self.menu["Модель у RAM:"].title = head
+        for i, key in enumerate(("loaded_line", "loaded_line2", "loaded_line3")):
+            it = self.menu[key]
+            if i < len(rows):
+                it.title = rows[i]; it._menuitem.setHidden_(False)
+            else:
+                it.title = ""; it._menuitem.setHidden_(True)
+
     def _set_menu_sym(self, item, name):
         try: item._menuitem.setImage_(self._menu_img(name))
         except Exception: pass
@@ -5908,12 +5508,7 @@ class Panel(rumps.App):
         else:
             self.menu["tts_toggle"].title = "Зупинити голос (TTS)" if tts else "Запустити голос (TTS)"
             self._set_menu_sym(self.menu["tts_toggle"], "stop.fill" if tts else "play.fill")
-        loaded = ps_loaded(3)
-        if loaded:
-            nm = loaded[0].split("  ")[0].strip(); sz = ram_size(loaded[0])
-            self.menu["loaded_line"].title = "   " + nm + (f"  ·  {sz}" if sz else "")
-        else:
-            self.menu["loaded_line"].title = "   (нічого — RAM вільна)"
+        self._paint_ram_lines(ps_loaded(3))
         if self._state == "synth":
             p, sym = ("Продовжити (стартує на паузі)", "play.fill") if self._pause_pending \
                 else ("Синтез…", "hourglass")

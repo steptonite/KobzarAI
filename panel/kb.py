@@ -154,6 +154,8 @@ class _Cooler:
 
 
 class KB:
+    cosine_scores = True        # score = справжній косинус (нормовані вектори)
+
     def __init__(self, db_path, host="127.0.0.1:11434"):
         self.db_path = db_path
         self.host = host
@@ -287,6 +289,7 @@ class AttachedIndex:
     sqlite-vec MATCH. Нічого не переембедить — ембедиться лише короткий запит, далі
     миттєвий KNN по готових векторах. Схема: chunks(id,text[,source,ref]) + vec0-табличка.
     Так «мільйони токенів» НЕ гріють мак повторно — беремо готове."""
+    cosine_scores = False       # score = 1 − відстань чужого індексу: метрика невідома
     def __init__(self, db_path, host="127.0.0.1:11434"):
         try:
             import sqlite_vec
@@ -453,16 +456,64 @@ def open_index(path, host="127.0.0.1:11434"):
     return KB(path, host=host)          # native: KB.search читає власні blob-вектори
 
 
+# ── відбір і бюджет контексту (30.09.2026) ──────────────────────────────
+# Косинус bge-m3: справді дотичні фрагменти ~0.5–0.7, «просто схоже за словами» ~0.3–0.4.
+# Нижче порога — шум: краще чесно сказати «нічого схожого», ніж підсунути моделі сміття.
+KB_MIN_SCORE = 0.32       # абсолютний поріг (лише коли оцінка — справжній косинус)
+KB_REL_GAP = 0.18         # відкидаємо все, що слабше за найкращий збіг більше ніж на це
+
+
+def filter_hits(hits, cosine=True):
+    """Прибрати явно слабкі збіги. Немає числової оцінки — лишаємо як є.
+    cosine=False (чужий індекс, метрика невідома) — лише відносний відсів, без абсолютного порога."""
+    hits = list(hits or [])
+    scores = [h.get("score") for h in hits if isinstance(h.get("score"), (int, float))]
+    if not scores or len(scores) != len(hits):
+        return hits
+    top = max(scores)
+    if cosine and top < KB_MIN_SCORE:
+        return []
+    return [h for h in hits if h["score"] >= top - KB_REL_GAP and (not cosine or h["score"] >= KB_MIN_SCORE)]
+
+
+def context_budget(num_ctx):
+    """Скільки символів фрагментів можна віддати моделі: ~0.9 від розміру контексту, 2400…8000."""
+    try:
+        n = int(num_ctx)
+    except (TypeError, ValueError):
+        n = 4096
+    return max(2400, min(8000, int(n * 0.9)))
+
+
+def select_for_context(hits, max_chars=2400):
+    """Які саме шматки влізуть у бюджет (порядок збережено, мінімум один)."""
+    used, total = [], 0
+    for h in hits or []:
+        tag = os.path.basename(h.get("path", "")) or "джерело"
+        n = len("[%s]\n%s" % (tag, (h.get("text") or "").strip()))
+        if total + n > max_chars and used:
+            break
+        used.append(h)
+        total += n
+    return used
+
+
 def build_context(hits, max_chars=2400):
     """Зібрати retrieved-шматки у блок для системного промту. Обрізає до бюджету."""
-    if not hits:
-        return ""
-    parts, used = [], 0
-    for h in hits:
+    parts = []
+    for h in select_for_context(hits, max_chars):
         tag = os.path.basename(h.get("path", "")) or "джерело"
-        block = "[%s]\n%s" % (tag, h.get("text", "").strip())
-        if used + len(block) > max_chars and parts:
-            break
-        parts.append(block)
-        used += len(block)
+        parts.append("[%s]\n%s" % (tag, (h.get("text") or "").strip()))
     return "\n\n".join(parts)
+
+
+def trim_history(messages, max_chars):
+    """Вкласти розмову в бюджет: викидаємо найстаріші повідомлення, останнє лишаємо завжди;
+    після обрізання розмова починається з репліки користувача."""
+    msgs = list(messages or [])
+    size = lambda ms: sum(len(m.get("content") or "") for m in ms)
+    while len(msgs) > 1 and size(msgs) > max_chars:
+        msgs.pop(0)
+    while len(msgs) > 1 and msgs[0].get("role") != "user":
+        msgs.pop(0)
+    return msgs
