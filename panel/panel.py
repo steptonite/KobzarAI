@@ -43,6 +43,16 @@ try:
 except Exception:
     _addon = None
 
+def _browser_chat_menu():
+    """Optional addon owns its tab; no menu entry without an installed browser addon."""
+    if _addon is None:
+        return []
+    try:
+        return ["browser_chats"] if any(t.get("key") == "browser" for t in _addon.tabs()) else []
+    except Exception:
+        return []
+
+
 # 26.09: автодоповнення команд @/… у чаті — borderless non-activating панель.
 try:
     from AppKit import NSPanel, NSWindowStyleMaskNonactivatingPanel, NSFloatingWindowLevel
@@ -5132,7 +5142,7 @@ class Panel(rumps.App):
             "speak_sel", "speak_clip", "tts_pause", "tts_stop", None,
             "hdr_services",
             "ollama_toggle", "ollama_reason", "unload_models", "tts_toggle", None,
-            "chat_open", "settings", None,
+            "chat_open", "settings", *_browser_chat_menu(), None,
             "quit",
         ]
         # Постійний підпис-причина під «Запустити Ollama»: без callback → завжди сірий
@@ -5167,6 +5177,9 @@ class Panel(rumps.App):
         self.menu["tts_stop"].set_callback(self.stop_speech)
         self.menu["chat_open"].set_callback(self.open_chat)
         self.menu["settings"].set_callback(self.open_settings)
+        if "browser_chats" in self.menu:
+            self.menu["browser_chats"].title = "Браузерні чати…"
+            self.menu["browser_chats"].set_callback(self.open_browser_chats)
         self.menu["quit"].set_callback(self.quit_all)
         self.hotkeys = Hotkeys(self); self.hotkeys.start()
         self.timer = rumps.Timer(self.refresh, 1); self.timer.start()
@@ -5281,6 +5294,16 @@ class Panel(rumps.App):
         if self._settings is None:
             self._settings = SettingsWindow.alloc().initWithPanel_(self)
         self._settings.show()
+
+    def open_browser_chats(self, _):
+        if not _browser_chat_menu():
+            return
+        if self._settings is None:
+            self._settings = SettingsWindow.alloc().initWithPanel_(self)
+        index = self._settings._ext_tab_index("browser")
+        if index is not None:
+            self._settings.show()
+            self._settings.select_tab(index)
 
     def open_chat(self, _):
         if self._settings is None:
